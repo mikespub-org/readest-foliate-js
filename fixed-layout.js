@@ -1,3 +1,4 @@
+//import 'construct-style-sheets-polyfill'
 import './vendor/adoptedStyleSheets.js'
 
 const parseViewport = str => str
@@ -46,6 +47,18 @@ export class FixedLayout extends HTMLElement {
     #side
     #zoom
     #scaleFactor = 1.0
+    #totalScaleFactor = 1.0
+    #scrollLocked = false
+    #isOverflowX = false
+    #isOverflowY = false
+    #preloadCache = new Map()
+    #prerenderedSpreads = new Map()
+    #spreadAccessTime = new Map()
+    #maxConcurrentPreloads = 1
+    #numPrerenderedSpreads = 1
+    #maxCachedSpreads = 2
+    #preloadQueue = []
+    #activePreloads = 0
     constructor() {
         super()
 
@@ -55,9 +68,14 @@ export class FixedLayout extends HTMLElement {
             width: 100%;
             height: 100%;
             display: flex;
-            justify-content: center;
+            justify-content: flex-start;
             align-items: center;
             overflow: auto;
+        }
+        @supports (justify-content: safe center) {
+          :host {
+            justify-content: safe center;
+          }
         }`)
 
         this.#observer.observe(this)
@@ -78,7 +96,7 @@ export class FixedLayout extends HTMLElement {
                 break
         }
     }
-    async #createFrame({ index, src: srcOption }) {
+    async #createFrame({ index, src: srcOption, detached = false }) {
         const srcOptionIsString = typeof srcOption === 'string'
         const src = srcOptionIsString ? srcOption : srcOption?.src
         const data = srcOptionIsString ? null : srcOption?.data
@@ -98,6 +116,15 @@ export class FixedLayout extends HTMLElement {
         iframe.setAttribute('scrolling', 'no')
         iframe.setAttribute('part', 'filter')
         this.#root.append(element)
+
+        if (detached) {
+            Object.assign(element.style, {
+                position: 'absolute',
+                visibility: 'hidden',
+                pointerEvents: 'none',
+            })
+        }
+
         if (!src) return { blank: true, element, iframe }
         return new Promise(resolve => {
             iframe.addEventListener('load', () => {
@@ -109,6 +136,7 @@ export class FixedLayout extends HTMLElement {
                     width: parseFloat(width),
                     height: parseFloat(height),
                     onZoom,
+                    detached,
                 })
             }, { once: true })
             if (data) {
@@ -124,8 +152,9 @@ export class FixedLayout extends HTMLElement {
         const right = this.#center ?? this.#right ?? {}
         const target = side === 'left' ? left : right
         const { width, height } = this.getBoundingClientRect()
+        // for unfolded devices with slightly taller height than width also use landscape layout
         const portrait = this.spread !== 'both' && this.spread !== 'portrait'
-            && height > width
+            && height > width * 1.2
         this.#portrait = portrait
         const blankWidth = left.width ?? right.width ?? 0
         const blankHeight = left.height ?? right.height ?? 0
@@ -148,11 +177,15 @@ export class FixedLayout extends HTMLElement {
             ) || 1
         scale *= this.#scaleFactor
 
-        const transform = frame => {
+        scale *= this.#scaleFactor
+        this.#totalScaleFactor = scale
+
+        const transform = ({frame, styles}) => {
             let { element, iframe, width, height, blank, onZoom } = frame
             if (!iframe) return
             if (onZoom) onZoom({ doc: frame.iframe.contentDocument, scale })
             const iframeScale = onZoom ? scale : 1
+            const zoomedOut = this.#scaleFactor < 1.0
             Object.assign(iframe.style, {
                 width: `${width * iframeScale}px`,
                 height: `${height * iframeScale}px`,
@@ -163,38 +196,91 @@ export class FixedLayout extends HTMLElement {
             Object.assign(element.style, {
                 width: `${(width ?? blankWidth) * scale}px`,
                 height: `${(height ?? blankHeight) * scale}px`,
-                overflow: 'hidden',
-                display: 'block',
                 flexShrink: '0',
-                marginBlock: 'auto',
+                display: zoomedOut ? 'flex' : 'block',
+                marginBlock: zoomedOut ? undefined : 'auto',
+                alignItems: zoomedOut ? 'center' : undefined,
+                justifyContent: zoomedOut ? 'center' : undefined,
+                ...styles,
             })
             if (portrait && frame !== target) {
                 element.style.display = 'none'
             }
+
+            const container= element.parentNode.host
+            const containerWidth = container.clientWidth
+            const containerHeight = container.clientHeight
+            container.scrollLeft = (element.clientWidth - containerWidth) / 2
+
+            return {
+                width: element.clientWidth,
+                height: element.clientHeight,
+                containerWidth,
+                containerHeight,
+            }
         }
         if (this.#center) {
-            transform(this.#center)
+            const dimensions = transform({frame: this.#center, styles: { marginInline: 'auto' }})
+            const {width, height, containerWidth, containerHeight} = dimensions
+            this.#isOverflowX = width > containerWidth
+            this.#isOverflowY = height > containerHeight
         } else {
-            transform(left)
-            transform(right)
+            const leftDimensions = transform({frame: left, styles: { marginInlineStart: 'auto' }})
+            const rightDimensions = transform({frame: right, styles: { marginInlineEnd: 'auto' }})
+            const {width: leftWidth, height: leftHeight, containerWidth, containerHeight} = leftDimensions
+            const {width: rightWidth, height: rightHeight} = rightDimensions
+            this.#isOverflowX = leftWidth + rightWidth > containerWidth
+            this.#isOverflowY = Math.max(leftHeight, rightHeight) > containerHeight
         }
     }
-    async #showSpread({ left, right, center, side }) {
-        this.#root.replaceChildren()
+    async #showSpread({ left, right, center, side, spreadIndex }) {
         this.#left = null
         this.#right = null
         this.#center = null
-        if (center) {
-            this.#center = await this.#createFrame(center)
-            this.#side = 'center'
-            this.#render()
+
+        const cacheKey = spreadIndex !== undefined ? `spread-${spreadIndex}` : null
+        const prerendered = cacheKey ? this.#prerenderedSpreads.get(cacheKey) : null
+
+        if (prerendered) {
+            this.#spreadAccessTime.set(cacheKey, Date.now())
+            if (prerendered.center) {
+                this.#center = prerendered.center
+            } else {
+                this.#left = prerendered.left
+                this.#right = prerendered.right
+            }
         } else {
-            this.#left = await this.#createFrame(left)
-            this.#right = await this.#createFrame(right)
-            this.#side = this.#left.blank ? 'right'
-                : this.#right.blank ? 'left' : side
-            this.#render()
+            if (center) {
+                this.#center = await this.#createFrame(center)
+                if (cacheKey) {
+                    this.#prerenderedSpreads.set(cacheKey, { center: this.#center })
+                    this.#spreadAccessTime.set(cacheKey, Date.now())
+                }
+            } else {
+                this.#left = await this.#createFrame(left)
+                this.#right = await this.#createFrame(right)
+                if (cacheKey) {
+                    this.#prerenderedSpreads.set(cacheKey, { left: this.#left, right: this.#right })
+                    this.#spreadAccessTime.set(cacheKey, Date.now())
+                }
+            }
         }
+
+        this.#side = center ? 'center' : this.#left.blank ? 'right'
+            : this.#right.blank ? 'left' : side
+        const visibleFrames = center
+            ? [this.#center?.element]
+            : [this.#left?.element, this.#right?.element]
+
+        Array.from(this.#root.children).forEach(child => {
+            const isVisible = visibleFrames.includes(child)
+            Object.assign(child.style, {
+                position: isVisible ? 'relative' : 'absolute',
+                visibility: isVisible ? 'visible' : 'hidden',
+                pointerEvents: isVisible ? 'auto' : 'none',
+            })
+        })
+        this.#render()
     }
     #goLeft() {
         if (this.#center || this.#left?.blank) return
@@ -269,6 +355,17 @@ export class FixedLayout extends HTMLElement {
         this.#spread(spreadMode)
         const { index } = this.getSpreadOf(section)
         this.#index = -1
+        this.#preloadCache.clear()
+        for (const frames of this.#prerenderedSpreads.values()) {
+            if (frames.center) {
+                frames.center.element?.remove()
+            } else {
+                frames.left?.element?.remove()
+                frames.right?.element?.remove()
+            }
+        }
+        this.#prerenderedSpreads.clear()
+        this.#spreadAccessTime.clear()
         this.goToSpread(index, this.rtl ? 'right' : 'left', 'page')
     }
     get index() {
@@ -276,6 +373,18 @@ export class FixedLayout extends HTMLElement {
         const section = spread?.center ?? (this.#side === 'left'
             ? spread.left ?? spread.right : spread.right ?? spread.left)
         return this.book.sections.indexOf(section)
+    }
+    get scrollLocked() {
+        return this.#scrollLocked
+    }
+    set scrollLocked(value) {
+        this.#scrollLocked = value
+    }
+    get isOverflowX() {
+        return this.#isOverflowX
+    }
+    get isOverflowY() {
+        return this.#isOverflowY
     }
     #reportLocation(reason) {
         this.dispatchEvent(new CustomEvent('relocate', { detail:
@@ -298,20 +407,157 @@ export class FixedLayout extends HTMLElement {
         }
         this.#index = index
         const spread = this.#spreads[index]
-        if (spread.center) {
-            const index = this.book.sections.indexOf(spread.center)
-            const src = await spread.center?.load?.()
-            await this.#showSpread({ center: { index, src } })
+        const cacheKey = `spread-${index}`
+        const cached = this.#preloadCache.get(cacheKey)
+        if (cached && cached !== 'loading') {
+            if (cached.center) {
+                const sectionIndex = this.book.sections.indexOf(spread.center)
+                await this.#showSpread({ center: { index: sectionIndex, src: cached.center }, spreadIndex: index, side })
+            } else {
+                const indexL = this.book.sections.indexOf(spread.left)
+                const indexR = this.book.sections.indexOf(spread.right)
+                const left = { index: indexL, src: cached.left }
+                const right = { index: indexR, src: cached.right }
+                await this.#showSpread({ left, right, side, spreadIndex: index })
+            }
         } else {
-            const indexL = this.book.sections.indexOf(spread.left)
-            const indexR = this.book.sections.indexOf(spread.right)
-            const srcL = await spread.left?.load?.()
-            const srcR = await spread.right?.load?.()
-            const left = { index: indexL, src: srcL }
-            const right = { index: indexR, src: srcR }
-            await this.#showSpread({ left, right, side })
+            if (spread.center) {
+                const sectionIndex = this.book.sections.indexOf(spread.center)
+                const src = await spread.center?.load?.()
+                await this.#showSpread({ center: { index: sectionIndex, src }, spreadIndex: index, side })
+            } else {
+                const indexL = this.book.sections.indexOf(spread.left)
+                const indexR = this.book.sections.indexOf(spread.right)
+                const srcL = await spread.left?.load?.()
+                const srcR = await spread.right?.load?.()
+                const left = { index: indexL, src: srcL }
+                const right = { index: indexR, src: srcR }
+                await this.#showSpread({ left, right, side, spreadIndex: index })
+            }
         }
+
         this.#reportLocation(reason)
+        this.#preloadNextSpreads()
+    }
+    #preloadNextSpreads() {
+        this.#cleanupPreloadCache()
+
+        if (this.#numPrerenderedSpreads <= 0) return
+
+        const toPreload = []
+        const forwardPreloadCount = Math.max(1, this.#numPrerenderedSpreads - 1)
+        const backwardPreloadCount = Math.max(0, this.#numPrerenderedSpreads - forwardPreloadCount)
+        for (let distance = 1; distance <= forwardPreloadCount; distance++) {
+            const forwardIndex = this.#index + distance
+            if (forwardIndex >= 0 && forwardIndex < this.#spreads.length) {
+                toPreload.push({ index: forwardIndex, direction: 'forward', distance })
+            }
+        }
+        for (let distance = 1; distance <= backwardPreloadCount; distance++) {
+            const backwardIndex = this.#index - distance
+            if (backwardIndex >= 0 && backwardIndex < this.#spreads.length) {
+                toPreload.push({ index: backwardIndex, direction: 'backward', distance })
+            }
+        }
+        for (const { index: targetIndex, direction } of toPreload) {
+            const cacheKey = `spread-${targetIndex}`
+            if (this.#prerenderedSpreads.has(cacheKey)) continue
+            const spread = this.#spreads[targetIndex]
+            if (!spread) continue
+            this.#preloadQueue.push({ targetIndex, direction, spread, cacheKey })
+        }
+
+        this.#processPreloadQueue()
+    }
+
+    async #processPreloadQueue() {
+        while (this.#preloadQueue.length > 0 && this.#activePreloads < this.#maxConcurrentPreloads) {
+            const task = this.#preloadQueue.shift()
+            if (!task) break
+
+            const { spread, cacheKey } = task
+            this.#preloadCache.set(cacheKey, 'loading')
+            this.#activePreloads++
+            Promise.resolve().then(async () => {
+                try {
+                    if (spread.center) {
+                        const src = await spread.center?.load?.()
+                        this.#preloadCache.set(cacheKey, { center: src })
+
+                        const sectionIndex = this.book.sections.indexOf(spread.center)
+                        const frame = await this.#createFrame({ index: sectionIndex, src, detached: true })
+
+                        this.#prerenderedSpreads.set(cacheKey, { center: frame })
+                        this.#spreadAccessTime.set(cacheKey, Date.now())
+                        if (frame.onZoom) {
+                            const doc = frame.iframe.contentDocument
+                            frame.onZoom({ doc, scale: this.#totalScaleFactor })
+                        }
+                    } else {
+                        const srcL = await spread.left?.load?.()
+                        const srcR = await spread.right?.load?.()
+                        this.#preloadCache.set(cacheKey, { left: srcL, right: srcR })
+
+                        const indexL = this.book.sections.indexOf(spread.left)
+                        const indexR = this.book.sections.indexOf(spread.right)
+                        const leftFrame = await this.#createFrame({ index: indexL, src: srcL, detached: true })
+                        const rightFrame = await this.#createFrame({ index: indexR, src: srcR, detached: true })
+
+                        this.#prerenderedSpreads.set(cacheKey, { left: leftFrame, right: rightFrame })
+                        this.#spreadAccessTime.set(cacheKey, Date.now())
+
+                        if (leftFrame.onZoom) {
+                            const docL = leftFrame.iframe.contentDocument
+                            leftFrame.onZoom({ doc: docL, scale: this.#totalScaleFactor })
+                        }
+                        if (rightFrame.onZoom) {
+                            const docR = rightFrame.iframe.contentDocument
+                            rightFrame.onZoom({ doc: docR, scale: this.#totalScaleFactor })
+                        }
+                    }
+                } catch {
+                    this.#preloadCache.delete(cacheKey)
+                    this.#prerenderedSpreads.delete(cacheKey)
+                } finally {
+                    this.#activePreloads--
+                    this.#processPreloadQueue()
+                }
+            })
+        }
+    }
+    #cleanupPreloadCache() {
+        const maxSpreads = this.#maxCachedSpreads
+        if (this.#prerenderedSpreads.size <= maxSpreads) {
+            return
+        }
+
+        const framesByAge = Array.from(this.#prerenderedSpreads.keys())
+            .map(key => ({
+                key,
+                accessTime: this.#spreadAccessTime.get(key) || 0,
+            }))
+            .sort((a, b) => a.accessTime - b.accessTime)
+
+        const numToRemove = this.#prerenderedSpreads.size - maxSpreads
+        const framesToDelete = framesByAge.slice(0, numToRemove).map(item => item.key)
+
+        if (framesToDelete.length > 0) {
+            framesToDelete.forEach(key => {
+                const frames = this.#prerenderedSpreads.get(key)
+                if (frames) {
+                    if (frames.center) {
+                        frames.center.element?.remove()
+                    } else {
+                        frames.left?.element?.remove()
+                        frames.right?.element?.remove()
+                    }
+                }
+
+                this.#prerenderedSpreads.delete(key)
+                this.#spreadAccessTime.delete(key)
+                this.#preloadCache.delete(key)
+            })
+        }
     }
     async select(target) {
         await this.goTo(target)
@@ -333,6 +579,22 @@ export class FixedLayout extends HTMLElement {
         const s = this.rtl ? this.#goRight() : this.#goLeft()
         if (!s) return this.goToSpread(this.#index - 1, this.rtl ? 'left' : 'right', 'page')
     }
+    async pan(dx, dy) {
+        if (this.#scrollLocked) return
+        this.#scrollLocked = true
+
+        const transform = frame => {
+            let { element, iframe } = frame
+            if (!iframe || !element) return
+
+            const scrollableContainer = element.parentNode.host
+            scrollableContainer.scrollLeft += dx
+            scrollableContainer.scrollTop += dy
+        }
+
+        transform(this.#center ?? this.#right ?? {})
+        this.#scrollLocked = false
+    }
     getContents() {
         return Array.from(this.#root.querySelectorAll('iframe'), frame => ({
             doc: frame.contentDocument,
@@ -341,6 +603,17 @@ export class FixedLayout extends HTMLElement {
     }
     destroy() {
         this.#observer.unobserve(this)
+        for (const frames of this.#prerenderedSpreads.values()) {
+            if (frames.center) {
+                frames.center.element?.remove()
+            } else {
+                frames.left?.element?.remove()
+                frames.right?.element?.remove()
+            }
+        }
+        this.#prerenderedSpreads.clear()
+        this.#preloadCache.clear()
+        this.#spreadAccessTime.clear()
     }
 }
 

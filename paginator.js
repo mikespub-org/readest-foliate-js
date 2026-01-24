@@ -165,7 +165,7 @@ const setSelectionTo = (target, collapse) => {
         range.selectNode(target)
     }
     if (range) {
-        const sel = range.startContainer.ownerDocument.defaultView.getSelection()
+        const sel = range.startContainer.ownerDocument?.defaultView.getSelection()
         if (sel) {
             sel.removeAllRanges()
             if (collapse === -1) range.collapse(true)
@@ -302,11 +302,17 @@ class View {
         setStylesImportant(doc.documentElement, {
             'box-sizing': 'border-box',
             'padding': vertical
-                ? `${marginTop}px ${gap}px ${marginBottom}px ${gap}px`
-                : `0px ${gap / 2 + marginRight}px 0px ${gap / 2 + marginLeft}px`,
+                ? `${marginTop * 1.5}px ${marginRight}px ${marginBottom * 1.5}px ${marginLeft}px`
+                : `${marginTop}px ${gap / 2 + marginRight / 2}px ${marginBottom}px ${gap / 2 + marginLeft / 2}px`,
             'column-width': 'auto',
             'height': 'auto',
             'width': 'auto',
+            '--page-margin-top': `${vertical ? marginTop * 1.5 : marginTop}px`,
+            '--page-margin-right': `${vertical ? marginRight : marginRight + gap /2}px`,
+            '--page-margin-bottom': `${vertical ? marginBottom * 1.5 : marginBottom}px`,
+            '--page-margin-left': `${vertical ? marginLeft : marginLeft + gap / 2}px`,
+            '--available-width': `${Math.trunc(Math.min(window.innerWidth, columnWidth) - marginLeft - marginRight - gap - 60)}`,
+            '--available-height': `${Math.trunc(window.innerHeight - marginTop - marginBottom)}`,
         })
         setStylesImportant(doc.body, {
             [vertical ? 'max-height' : 'max-width']: `${columnWidth}px`,
@@ -323,14 +329,14 @@ class View {
         setStylesImportant(doc.documentElement, {
             'box-sizing': 'border-box',
             'column-width': `${Math.trunc(columnWidth)}px`,
-            'column-gap': vertical ? `${(marginTop + marginBottom) / 2}px` : `${gap + marginRight / 2 + marginLeft / 2}px`,
+            'column-gap': vertical ? `${(marginTop + marginBottom) * 1.5}px` : `${gap + marginRight / 2 + marginLeft / 2}px`,
             'column-fill': 'auto',
             ...(vertical
                 ? { 'width': `${width}px` }
                 : { 'height': `${height}px` }),
             'padding': vertical
-                ? `${marginTop / 2}px ${marginRight}px ${marginBottom / 2}px ${marginLeft}px`
-                : `0px ${gap / 2 + marginRight / 2}px 0px ${gap / 2 + marginLeft / 2}px`,
+                ? `${marginTop * 1.5}px ${marginRight}px ${marginBottom * 1.5}px ${marginLeft}px`
+                : `${marginTop}px ${gap / 2 + marginRight / 2}px ${marginBottom}px ${gap / 2 + marginLeft / 2}px`,
             'overflow': 'hidden',
             // force wrap long words
             'overflow-wrap': 'break-word',
@@ -340,6 +346,12 @@ class View {
             'min-height': 'none', 'min-width': 'none',
             // fix glyph clipping in WebKit
             '-webkit-line-box-contain': 'block glyphs replaced',
+            '--page-margin-top': `${vertical ? marginTop * 1.5 : marginTop}px`,
+            '--page-margin-right': `${vertical ? marginRight : marginRight / 2 + gap /2}px`,
+            '--page-margin-bottom': `${vertical ? marginBottom * 1.5 : marginBottom}px`,
+            '--page-margin-left': `${vertical ? marginLeft : marginLeft / 2 + gap / 2}px`,
+            '--available-width': `${Math.trunc(columnWidth - marginLeft - marginRight - gap)}`,
+            '--available-height': `${Math.trunc(height - marginTop - marginBottom)}`,
         })
         setStylesImportant(doc.body, {
             'max-height': 'none',
@@ -410,15 +422,13 @@ class View {
             const otherSide = this.#vertical ? 'height' : 'width'
             const contentSize = documentElement.getBoundingClientRect()[side]
             const expandedSize = contentSize
-            const { marginTop, marginRight, marginBottom, marginLeft } = this.#layout
-            const padding = this.#vertical ? `0 ${marginRight}px 0 ${marginLeft}px` : `${marginTop}px 0 ${marginBottom}px 0`
-            this.#element.style.padding = padding
+            this.#element.style.padding = '0'
             this.#iframe.style[side] = `${expandedSize}px`
             this.#element.style[side] = `${expandedSize}px`
             this.#iframe.style[otherSide] = '100%'
             this.#element.style[otherSide] = '100%'
             if (this.#overlayer) {
-                this.#overlayer.element.style.margin = padding
+                this.#overlayer.element.style.margin = '0'
                 this.#overlayer.element.style.left = '0'
                 this.#overlayer.element.style.top = '0'
                 this.#overlayer.element.style[side] = `${expandedSize}px`
@@ -469,6 +479,7 @@ export class Paginator extends HTMLElement {
     #touchState
     #touchScrolled
     #lastVisibleRange
+    #scrollLocked = false
     constructor() {
         super()
         this.#root.innerHTML = `<style>
@@ -501,11 +512,11 @@ export class Paginator extends HTMLElement {
             --_max-height: var(--_max-block-size);
             display: grid;
             grid-template-columns:
-                minmax(var(--_half-margin-left), 1fr)
-                var(--_half-margin-left)
+                minmax(0, 1fr)
+                var(--_margin-left)
                 minmax(0, calc(var(--_max-width) - var(--_gap)))
-                var(--_half-margin-right)
-                minmax(var(--_half-margin-right), 1fr);
+                var(--_margin-right)
+                minmax(0, 1fr);
             grid-template-rows:
                 minmax(var(--_margin-top), 1fr)
                 minmax(0, var(--_max-height))
@@ -530,11 +541,11 @@ export class Paginator extends HTMLElement {
         }
         #container {
             grid-column: 2 / 5;
-            grid-row: 2;
+            grid-row: 1 / -1;
             overflow: hidden;
         }
         :host([flow="scrolled"]) #container {
-            grid-column: 1 / -1;
+            grid-column: 2 / 5;
             grid-row: 1 / -1;
             overflow: auto;
         }
@@ -688,7 +699,7 @@ export class Paginator extends HTMLElement {
             if (detail.type !== 'text/css') return
             detail.data = Promise.resolve(detail.data).then(data => data
                 // unprefix as most of the props are (only) supported unprefixed
-                .replace(/(?<=[{\s;])-epub-/gi, '')
+                .replace(/([{\s;])-epub-/gi, '$1')
                 // `page-break-*` unsupported in columns; replace with `column-break-*`
                 .replace(/page-break-(after|before|inside)\s*:/gi, (_, x) =>
                     `-webkit-column-break-${x}:`)
@@ -713,16 +724,15 @@ export class Paginator extends HTMLElement {
         if (!doc) return
         const htmlStyle = doc.defaultView.getComputedStyle(doc.documentElement)
         const themeBgColor = htmlStyle.getPropertyValue('--theme-bg-color')
+        const overrideColor = htmlStyle.getPropertyValue('--override-color') === 'true'
+        const bgTextureId = htmlStyle.getPropertyValue('--bg-texture-id')
         const isDarkMode = htmlStyle.getPropertyValue('color-scheme') === 'dark'
         if (background && themeBgColor) {
             const parsedBackground = background.split(/\s(?=(?:url|rgb|hsl|#[0-9a-fA-F]{3,6}))/)
-            if (isDarkMode) {
+            if ((isDarkMode || overrideColor) && (bgTextureId === 'none' || !bgTextureId)) {
                 parsedBackground[0] = themeBgColor
             }
             background = parsedBackground.join(' ')
-        }
-        if (/cover.*fixed|fixed.*cover/.test(background)) {
-            background = background.replace('cover', 'auto 100%').replace('fixed', '')
         }
         this.#background.innerHTML = ''
         this.#background.style.display = 'grid'
@@ -785,12 +795,12 @@ export class Paginator extends HTMLElement {
             this.#header.replaceChildren()
             this.#footer.replaceChildren()
 
-            return { flow, marginTop, marginRight, marginBottom, marginLeft, gap: g * size, columnWidth }
+            return { flow, marginTop, marginRight, marginBottom, marginLeft, gap, columnWidth }
         }
 
-        const divisor = Math.min(maxColumnCount, Math.ceil(size / maxInlineSize))
+        const divisor = Math.min(maxColumnCount + (vertical ? 1 : 0), Math.ceil(Math.floor(size) / Math.floor(maxInlineSize)))
         const columnWidth = vertical
-            ? (size / divisor - (marginTop + marginBottom) / 2)
+            ? (size / divisor - marginTop * 1.5 - marginBottom * 1.5)
             : (size / divisor - gap - marginRight / 2 - marginLeft / 2)
         this.setAttribute('dir', rtl ? 'rtl' : 'ltr')
 
@@ -800,7 +810,7 @@ export class Paginator extends HTMLElement {
         this.#replaceBackground(background, this.columnCount)
 
         const marginalDivisor = vertical
-            ? Math.min(2, Math.ceil(width / maxInlineSize))
+            ? Math.min(2, Math.ceil(Math.floor(width) / Math.floor(maxInlineSize)))
             : divisor
         const marginalStyle = {
             gridTemplateColumns: `repeat(${marginalDivisor}, 1fr)`,
@@ -862,8 +872,17 @@ export class Paginator extends HTMLElement {
     get containerPosition() {
         return this.#container[this.scrollProp]
     }
+    get isOverflowX() {
+        return false
+    }
+    get isOverflowY() {
+        return false
+    }
     set containerPosition(newVal) {
         this.#container[this.scrollProp] = newVal
+    }
+    set scrollLocked(value) {
+        this.#scrollLocked = value
     }
 
     scrollBy(dx, dy) {
@@ -878,7 +897,7 @@ export class Paginator extends HTMLElement {
 
     snap(vx, vy) {
         const velocity = this.#vertical ? vy : vx
-        const horizontal = Math.abs(vx) > Math.abs(vy)
+        const horizontal = Math.abs(vx) * 2 > Math.abs(vy)
         const orthogonal = this.#vertical ? !horizontal : horizontal
         const [offset, a, b] = this.#scrollBounds
         const { start, end, pages, size } = this
@@ -887,7 +906,7 @@ export class Paginator extends HTMLElement {
         const d = velocity * (this.#rtl ? -size : size) * (orthogonal ? 1 : 0)
         const page = Math.floor(
             Math.max(min, Math.min(max, (start + end) / 2
-                + (isNaN(d) ? 0 : d))) / size)
+                + (isNaN(d) ? 0 : d * 2))) / size)
 
         this.#scrollToPage(page, 'snap').then(() => {
             const dir = page <= 0 ? -1 : page >= pages - 1 ? 1 : null
@@ -903,6 +922,7 @@ export class Paginator extends HTMLElement {
             x: touch?.screenX, y: touch?.screenY,
             t: e.timeStamp,
             vx: 0, xy: 0,
+            dx: 0, dy: 0,
         }
     }
     #onTouchMove(e) {
@@ -922,6 +942,7 @@ export class Paginator extends HTMLElement {
         const touch = e.changedTouches[0]
         const isStylus = touch.touchType === 'stylus'
         if (!isStylus) e.preventDefault()
+        if (this.#scrollLocked) return
         const x = touch.screenX, y = touch.screenY
         const dx = state.x - x, dy = state.y - y
         const dt = e.timeStamp - state.t
@@ -930,10 +951,13 @@ export class Paginator extends HTMLElement {
         state.t = e.timeStamp
         state.vx = dx / dt
         state.vy = dy / dt
+        state.dx += dx
+        state.dy += dy
         this.#touchScrolled = true
-        if (Math.abs(dx) >= Math.abs(dy) && (!isStylus || Math.abs(dx) > 1)) {
+        if (!this.hasAttribute('animated') || this.hasAttribute('eink')) return
+        if (!this.#vertical && Math.abs(state.dx) >= Math.abs(state.dy) && !this.hasAttribute('eink') && (!isStylus || Math.abs(dx) > 1)) {
             this.scrollBy(dx, 0)
-        } else if (Math.abs(dy) > Math.abs(dx) && (!isStylus || Math.abs(dy) > 1)) {
+        } else if (this.#vertical && Math.abs(state.dx) < Math.abs(state.dy) && !this.hasAttribute('eink') && (!isStylus || Math.abs(dy) > 1)) {
             this.scrollBy(0, dy)
         }
     }
@@ -959,7 +983,7 @@ export class Paginator extends HTMLElement {
             return this.#vertical
                 ? ({ left, right }) =>
                     ({ left: size - right - marginTop, right: size - left - marginBottom })
-                : ({ top, bottom }) => ({ left: top + marginTop, right: bottom + marginBottom })
+                : ({ top, bottom }) => ({ left: top - marginTop, right: bottom - marginBottom })
         }
         const pxSize = this.pages * this.size
         return this.#rtl
@@ -971,7 +995,7 @@ export class Paginator extends HTMLElement {
     }
     async #scrollToRect(rect, reason) {
         if (this.scrolled) {
-            const offset = this.#getRectMapper()(rect).left - this.#marginTop
+            const offset = this.#getRectMapper()(rect).left - 4
             return this.#scrollTo(offset, reason)
         }
         const offset = this.#getRectMapper()(rect).left
@@ -986,7 +1010,7 @@ export class Paginator extends HTMLElement {
         }
         // FIXME: vertical-rl only, not -lr
         if (this.scrolled && this.#vertical) offset = -offset
-        if ((reason === 'snap' || smooth) && this.hasAttribute('animated')) return animate(
+        if ((reason === 'snap' || smooth) && this.hasAttribute('animated') && !this.hasAttribute('eink')) return animate(
             this.containerPosition, offset, 300, easeOutQuad,
             x => this.containerPosition = x,
         ).then(() => {
@@ -1014,7 +1038,7 @@ export class Paginator extends HTMLElement {
             // when the start of the range is immediately after a hyphen in the
             // previous column, there is an extra zero width rect in that column
             const rect = Array.from(rects)
-                .find(r => r.width > 0 && r.height > 0) || rects[0]
+                .find(r => r.width > 0 && r.height > 0 && r.x >= 0 && r.y >= 0) || rects[0]
             if (!rect) return
             await this.#scrollToRect(rect, reason)
             // focus the element when navigating with keyboard or screen reader
@@ -1047,7 +1071,7 @@ export class Paginator extends HTMLElement {
     }
     #getVisibleRange() {
         if (this.scrolled) return getVisibleRange(this.#view.document,
-            this.start + this.#marginTop, this.end - this.#marginBottom, this.#getRectMapper())
+            this.start, this.end, this.#getRectMapper())
         const size = this.#rtl ? -this.size : this.size
         return getVisibleRange(this.#view.document,
             this.start - size, this.end - size, this.#getRectMapper())
@@ -1179,6 +1203,12 @@ export class Paginator extends HTMLElement {
     }
     async next(distance) {
         return await this.#turnPage(1, distance)
+    }
+    async pan(dx, dy) {
+        if (this.#locked) return
+        this.#locked = true
+        this.scrollBy(dx, dy)
+        this.#locked = false
     }
     prevSection() {
         return this.goTo({ index: this.#adjacentIndex(-1) })

@@ -95,10 +95,18 @@ export class Overlayer {
         const arr = Array.from(this.#map.entries())
         // loop in reverse to hit more recently added items first
         for (let i = arr.length - 1; i >= 0; i--) {
+            const tolerance = 5
             const [key, obj] = arr[i]
-            for (const { left, top, right, bottom } of obj.rects)
-                if (top <= y && left <= x && bottom > y && right > x)
-                    return [key, obj.range]
+            for (const { left, top, right, bottom } of obj.rects) {
+                if (
+                    top <= y + tolerance &&
+                    left <= x + tolerance &&
+                    bottom > y - tolerance &&
+                    right > x - tolerance
+                ) {
+                    return [key, obj.range, { left, top, right, bottom }]
+                }
+            }
         }
         return []
     }
@@ -207,6 +215,83 @@ export class Overlayer {
             el.setAttribute('rx', radius)
             g.append(el)
         }
+        return g
+    }
+    static bubble(rects, options = {}) {
+        const { color = '#fbbf24', writingMode, opacity = 0.85, size = 20, padding = 10 } = options
+        const isVertical = writingMode === 'vertical-rl' || writingMode === 'vertical-lr'
+        const g = createSVGElement('g')
+        g.style.opacity = opacity
+        if (rects.length === 0) return g
+        rects.splice(1)
+        const firstRect = rects[0]
+        const x = isVertical ? firstRect.right - size + padding : firstRect.right - size + padding
+        const y = isVertical ? firstRect.bottom - size + padding : firstRect.top - size + padding
+        firstRect.top = y - padding
+        firstRect.right = x + size + padding
+        firstRect.bottom = y + size + padding
+        firstRect.left = x - padding
+        const bubble = createSVGElement('path')
+        const s = size
+        const r = s * 0.15
+        // Speech bubble shape with a small tail
+        // Main rounded rectangle body
+        const d = `
+            M ${x + r} ${y}
+            h ${s - 2 * r}
+            a ${r} ${r} 0 0 1 ${r} ${r}
+            v ${s * 0.65 - 2 * r}
+            a ${r} ${r} 0 0 1 ${-r} ${r}
+            h ${-s * 0.3}
+            l ${-s * 0.15} ${s * 0.2}
+            l ${s * 0.05} ${-s * 0.2}
+            h ${-s * 0.6 + 2 * r}
+            a ${r} ${r} 0 0 1 ${-r} ${-r}
+            v ${-s * 0.65 + 2 * r}
+            a ${r} ${r} 0 0 1 ${r} ${-r}
+            z
+        `.replace(/\s+/g, ' ').trim()
+
+        bubble.setAttribute('d', d)
+        bubble.setAttribute('fill', color)
+        bubble.setAttribute('stroke', 'rgba(0, 0, 0, 0.2)')
+        bubble.setAttribute('stroke-width', '1')
+        // Add horizontal lines inside to represent text
+        const lineGroup = createSVGElement('g')
+        lineGroup.setAttribute('stroke', 'rgba(0, 0, 0, 0.3)')
+        lineGroup.setAttribute('stroke-width', '1.5')
+        lineGroup.setAttribute('stroke-linecap', 'round')
+        const lineY1 = y + s * 0.18
+        const lineY2 = y + s * 0.33
+        const lineY3 = y + s * 0.48
+        const lineX1 = x + s * 0.2
+        const lineX2 = x + s * 0.8
+        const line1 = createSVGElement('line')
+        line1.setAttribute('x1', lineX1)
+        line1.setAttribute('y1', lineY1)
+        line1.setAttribute('x2', lineX2)
+        line1.setAttribute('y2', lineY1)
+        const line2 = createSVGElement('line')
+        line2.setAttribute('x1', lineX1)
+        line2.setAttribute('y1', lineY2)
+        line2.setAttribute('x2', lineX2)
+        line2.setAttribute('y2', lineY2)
+        const line3 = createSVGElement('line')
+        line3.setAttribute('x1', lineX1)
+        line3.setAttribute('y1', lineY3)
+        line3.setAttribute('x2', x + s * 0.6)
+        line3.setAttribute('y2', lineY3)
+        lineGroup.append(line1, line2, line3)
+
+        if (isVertical) {
+            const centerX = x + s / 2
+            const centerY = y + s / 2
+            bubble.setAttribute('transform', `rotate(90 ${centerX} ${centerY})`)
+            lineGroup.setAttribute('transform', `rotate(90 ${centerX} ${centerY})`)
+        }
+
+        g.append(bubble)
+        g.append(lineGroup)
         return g
     }
     // make an exact copy of an image in the overlay

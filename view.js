@@ -5,6 +5,8 @@ import { textWalker } from './text-walker.js'
 
 const SEARCH_PREFIX = 'foliate-search:'
 
+const NOTE_PREFIX = 'foliate-note:'
+
 const isZip = async file => {
     const arr = new Uint8Array(await file.slice(0, 4).arrayBuffer())
     return arr[0] === 0x50 && arr[1] === 0x4b && arr[2] === 0x03 && arr[3] === 0x04
@@ -389,6 +391,21 @@ export class View extends HTMLElement {
                 overlayer.add(value, range, Overlayer.outline)
             }
             return
+        } else if (value.startsWith(NOTE_PREFIX)) {
+            const cfi = value.replace(NOTE_PREFIX, '')
+            const { index, anchor } = await this.resolveNavigation(cfi)
+            const obj = this.#getOverlayer(index)
+            if (obj) {
+                const { overlayer, doc } = obj
+                if (remove) {
+                    overlayer.remove(value)
+                    return
+                }
+                const range = doc ? anchor(doc) : anchor
+                const draw = (func, opts) => overlayer.add(value, range, func, opts)
+                this.#emit('draw-annotation', { draw, annotation, doc, range })
+            }
+            return
         }
         const { index, anchor } = await this.resolveNavigation(value)
         const obj = this.#getOverlayer(index)
@@ -414,11 +431,28 @@ export class View extends HTMLElement {
     #createOverlayer({ doc, index }) {
         const overlayer = new Overlayer(doc)
         doc.addEventListener('click', e => {
-            const [value, range] = overlayer.hitTest(e)
+            const [value, range, rect] = overlayer.hitTest(e)
             if (value && !value.startsWith(SEARCH_PREFIX)) {
-                this.#emit('show-annotation', { value, index, range })
+                this.#emit('show-annotation', { value, index, range, rect })
             }
         }, false)
+
+        let lastHitTestTime = 0
+        const THROTTLE_MS = 200
+        const isAndroid = /Android/i.test(navigator.userAgent)
+
+        doc.addEventListener('mousemove', (e) => {
+            if (isAndroid) return
+            const now = performance.now()
+            if (now - lastHitTestTime < THROTTLE_MS) return
+            lastHitTestTime = now
+            const [value] = overlayer.hitTest(e)
+            if (value && !value.startsWith(SEARCH_PREFIX)) {
+                doc.body.style.cursor = 'pointer'
+            } else {
+                doc.body.style.cursor = ''
+            }
+        })
 
         const list = this.#searchResults.get(index)
         if (list) for (const item of list) this.addAnnotation(item)
@@ -524,6 +558,15 @@ export class View extends HTMLElement {
     async next(distance) {
         await this.renderer.next(distance)
     }
+    async pan(dx, dy) {
+        await this.renderer.pan(dx, dy)
+    }
+    isOverflowX() {
+        return this.renderer.isOverflowX
+    }
+    isOverflowY() {
+        return this.renderer.isOverflowY
+    }
     goLeft() {
         return this.book.dir === 'rtl' ? this.next() : this.prev()
     }
@@ -550,12 +593,26 @@ export class View extends HTMLElement {
     async * search(opts) {
         this.clearSearch()
         const { searchMatcher } = await import('./search.js')
-        const { query, index } = opts
+        const { sections } = this.book
+        const { query, index, results } = opts
         const matcher = searchMatcher(textWalker,
             { defaultLocale: this.language, ...opts })
-        const iter = index != null
-            ? this.#searchSection(matcher, query, index)
-            : this.#searchBook(matcher, query)
+
+        const iter = results?.length
+            ? (async function* () {
+                for (const result of results) {
+                    if (result.subitems) {
+                        const progress = (result.index + 1) / sections.length
+                        yield { progress }
+                        yield { index: result.index, subitems: result.subitems }
+                    } else {
+                        yield { cfi: result.cfi, excerpt: result.excerpt }
+                    }
+                }
+            })()
+            : index != null
+                ? this.#searchSection(matcher, query, index)
+                : this.#searchBook(matcher, query)
 
         const list = []
         this.#searchResults.set(index, list)
@@ -567,6 +624,7 @@ export class View extends HTMLElement {
                 this.#searchResults.set(result.index, list)
                 for (const item of list) this.addAnnotation(item)
                 yield {
+                    index: result.index,
                     label: this.#tocProgress.getProgress(result.index)?.label ?? '',
                     subitems: result.subitems,
                 }

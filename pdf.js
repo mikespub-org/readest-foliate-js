@@ -1,6 +1,8 @@
 const pdfjsPath = path => new URL(`vendor/pdfjs/${path}`, import.meta.url).toString()
+//const pdfjsPath = path => `/vendor/pdfjs/${path}`
 
 import './vendor/pdfjs/pdf.mjs'
+//import '@pdfjs/pdf.mjs'
 const pdfjsLib = globalThis.pdfjsLib
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsPath('pdf.worker.mjs')
 
@@ -10,10 +12,14 @@ let textLayerBuilderCSS = null
 let annotationLayerBuilderCSS = null
 
 const render = async (page, doc, zoom) => {
+    if (!doc) return
     const scale = zoom * devicePixelRatio
     doc.documentElement.style.transform = `scale(${1 / devicePixelRatio})`
     doc.documentElement.style.transformOrigin = 'top left'
-    doc.documentElement.style.setProperty('--scale-factor', scale)
+    doc.documentElement.style.setProperty('--total-scale-factor', scale)
+    doc.documentElement.style.setProperty('--user-unit', '1')
+    doc.documentElement.style.setProperty('--scale-round-x', '1px')
+    doc.documentElement.style.setProperty('--scale-round-y', '1px')
     const viewport = page.getViewport({ scale })
 
     // the canvas must be in the `PDFDocument`'s `ownerDocument`
@@ -23,7 +29,9 @@ const render = async (page, doc, zoom) => {
     canvas.width = viewport.width
     const canvasContext = canvas.getContext('2d')
     await page.render({ canvasContext, viewport }).promise
-    doc.querySelector('#canvas').replaceChildren(doc.adoptNode(canvas))
+    const canvasElement = doc.querySelector('#canvas')
+    if (!canvasElement) return
+    canvasElement.replaceChildren(doc.adoptNode(canvas))
 
     const container = doc.querySelector('.textLayer')
     const textLayer = new pdfjsLib.TextLayer({
@@ -32,7 +40,7 @@ const render = async (page, doc, zoom) => {
     })
     await textLayer.render()
 
-    // hide "offscreen" canvases appended to docuemnt when rendering text layer
+    // hide "offscreen" canvases appended to document when rendering text layer
     // https://github.com/mozilla/pdf.js/blob/642b9a5ae67ef642b9a8808fd9efd447e8c350e2/web/pdf_viewer.css#L51-L58
     for (const canvas of document.querySelectorAll('.hiddenCanvasElement'))
         Object.assign(canvas.style, {
@@ -49,18 +57,122 @@ const render = async (page, doc, zoom) => {
     const endOfContent = document.createElement('div')
     endOfContent.className = 'endOfContent'
     container.append(endOfContent)
-    // TODO: this only works in Firefox; see https://github.com/mozilla/pdf.js/pull/17923
-    container.onpointerdown = () => container.classList.add('selecting')
-    container.onpointerup = () => container.classList.remove('selecting')
+
+    let isPanning = false
+    let startX = 0
+    let startY = 0
+    let scrollLeft = 0
+    let scrollTop = 0
+    let scrollParent = null
+
+    const findScrollableParent = (element) => {
+        let current = element
+        while (current) {
+            if (current !== document.body && current.nodeType === 1) {
+                const style = window.getComputedStyle(current)
+                const overflow = style.overflow + style.overflowY + style.overflowX
+                if (/(auto|scroll)/.test(overflow)) {
+                    if (current.scrollHeight > current.clientHeight ||
+                        current.scrollWidth > current.clientWidth) {
+                        return current
+                    }
+                }
+            }
+            if (current.parentElement) {
+                current = current.parentElement
+            } else if (current.parentNode && current.parentNode.host) {
+                current = current.parentNode.host
+            } else {
+                break
+            }
+        }
+        return window
+    }
+
+    container.onpointerdown = (e) => {
+        const selection = doc.getSelection()
+        const hasTextSelection = selection && selection.toString().length > 0
+
+        const elementUnderCursor = doc.elementFromPoint(e.clientX, e.clientY)
+        const hasTextUnderneath = elementUnderCursor &&
+                             (elementUnderCursor.tagName === 'SPAN' || elementUnderCursor.tagName === 'P') &&
+                             elementUnderCursor.textContent.trim().length > 0
+
+        if (!hasTextUnderneath && !hasTextSelection) {
+            isPanning = true
+            startX = e.screenX
+            startY = e.screenY
+
+            const iframe = doc.defaultView.frameElement
+            if (iframe) {
+                scrollParent = findScrollableParent(iframe)
+                if (scrollParent === window) {
+                    scrollLeft = window.scrollX || window.pageXOffset
+                    scrollTop = window.scrollY || window.pageYOffset
+                } else {
+                    scrollLeft = scrollParent.scrollLeft
+                    scrollTop = scrollParent.scrollTop
+                }
+                container.style.cursor = 'grabbing'
+            }
+        } else {
+            container.classList.add('selecting')
+        }
+    }
+
+    container.onpointermove = (e) => {
+        if (isPanning && scrollParent) {
+            e.preventDefault()
+
+            const dx = e.screenX - startX
+            const dy = e.screenY - startY
+
+            if (scrollParent === window) {
+                window.scrollTo(scrollLeft - dx, scrollTop - dy)
+            } else {
+                scrollParent.scrollLeft = scrollLeft - dx
+                scrollParent.scrollTop = scrollTop - dy
+            }
+        }
+    }
+
+    container.onpointerup = () => {
+        if (isPanning) {
+            isPanning = false
+            scrollParent = null
+            container.style.cursor = 'grab'
+        } else {
+            container.classList.remove('selecting')
+        }
+    }
+
+    container.onpointerleave = () => {
+        if (isPanning) {
+            isPanning = false
+            scrollParent = null
+            container.style.cursor = 'grab'
+        }
+    }
+
+    doc.addEventListener('selectionchange', () => {
+        const selection = doc.getSelection()
+        if (selection && selection.toString().length > 0) {
+            container.style.cursor = 'text'
+        } else if (!isPanning) {
+            container.style.cursor = 'grab'
+        }
+    })
+
+    container.style.cursor = 'grab'
 
     const div = doc.querySelector('.annotationLayer')
-    await new pdfjsLib.AnnotationLayer({ page, viewport, div }).render({
+    const linkService = {
+        goToDestination: () => {},
+        getDestinationHash: dest => JSON.stringify(dest),
+        addLinkAttributes: (link, url) => link.href = url,
+    }
+    await new pdfjsLib.AnnotationLayer({ page, viewport, div, linkService }).render({
         annotations: await page.getAnnotations(),
-        linkService: {
-            goToDestination: () => {},
-            getDestinationHash: dest => JSON.stringify(dest),
-            addLinkAttributes: (link, url) => link.href = url,
-        },
     })
 }
 
@@ -119,6 +231,7 @@ export const makePDF = async file => {
     }
     const pdf = await pdfjsLib.getDocument({
         range: transport,
+        wasmUrl: pdfjsPath(''),
         cMapUrl: pdfjsPath('cmaps/'),
         standardFontDataUrl: pdfjsPath('standard_fonts/'),
         isEvalSupported: false,
