@@ -38,7 +38,7 @@ const getSegmenter = (lang = 'en', granularity = 'word') => {
             const nextSegment = next?.segment?.trim()
             const endsWithAbbr = /(?:^|\s)([A-Z][a-z]{1,5})\.$/.test(segment)
             const nextStartsWithCapital = /^[A-Z]/.test(nextSegment || '')
-            if (endsWithAbbr && nextStartsWithCapital) {
+            if ((endsWithAbbr && nextStartsWithCapital) || segment.length <= 3) {
                 const mergedSegment = {
                     index: current.index,
                     segment: current.segment + (next?.segment || ''),
@@ -359,6 +359,12 @@ export class TTS {
                 break
             }
         return this.#speak(doc, ssml => this.#getMarkElement(ssml, mark))
+    }
+    getLastRange() {
+        if (this.#lastMark) {
+            const range = this.#ranges.get(this.#lastMark)
+            if (range) return range.cloneRange()
+        }
     }
     setMark(mark) {
         const range = this.#ranges.get(mark)
