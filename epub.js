@@ -401,6 +401,7 @@ const parseClock = str => {
 }
 
 const IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp']
+const FONT_EXTENSIONS = ['woff', 'woff2', 'ttf', 'otf']
 
 const getImageMediaType = (path) => {
     const extension = path.toLowerCase().split('.').pop()
@@ -412,6 +413,17 @@ const getImageMediaType = (path) => {
         'webp': 'image/webp',
     }
     return mediaTypeMap[extension] || 'image/jpeg'
+}
+
+const getFontMediaType = (path) => {
+    const extension = path.toLowerCase().split('.').pop()
+    const mediaTypeMap = {
+        'woff': 'font/woff',
+        'woff2': 'font/woff2',
+        'ttf': 'font/ttf',
+        'otf': 'font/otf',
+    }
+    return mediaTypeMap[extension] || 'font/ttf'
 }
 
 class MediaOverlay extends EventTarget {
@@ -800,11 +812,12 @@ class Loader {
         const { href, mediaType } = item
 
         const isScript = MIME.JS.test(item.mediaType)
-        const detail = { type: mediaType, isScript, allow: true}
+        const detail = { type: mediaType, href, isScript, allow: true}
         const event = new CustomEvent('load', { detail })
         this.eventTarget.dispatchEvent(event)
-        const allow = await event.detail.allow
+        const { allow, url } = await event.detail
         if (!allow) return null
+        if (url !== undefined) return url
 
         const parent = parents.at(-1)
         if (this.#cache.has(href)) return this.ref(href, parent)
@@ -834,12 +847,27 @@ class Loader {
             mediaType: getImageMediaType(path),
         }
     }
+    tryFontEntryItem(path) {
+        if (!FONT_EXTENSIONS.some(ext => path.toLowerCase().endsWith(`.${ext}`))) {
+            return null
+        }
+        if (this.entries.get(path)) {
+            return {
+                href: path,
+                mediaType: getFontMediaType(path),
+            }
+        }
+        return {
+            href: `fonts/${path.split('/').pop()}`,
+            mediaType: getFontMediaType(path),
+        }
+    }
     async loadHref(href, base, parents = []) {
         if (isExternal(href)) return href
         const path = resolveURL(href, base)
         let item = this.manifest.find(item => item.href === path)
         if (!item) {
-            item = this.tryImageEntryItem(path)
+            item = this.tryImageEntryItem(path) ?? this.tryFontEntryItem(path)
             if (!item) {
                 return href
             }
@@ -1178,11 +1206,25 @@ ${doc.querySelector('parsererror').innerText}`)
             const newSubitems = []
 
             for (const [sectionId, subitems] of groupedBySection.entries()) {
-                const groupedItem = subitems.length === 1
-                    ? subitems[0]  // Single item, keep as-is
-                    : createGroupedItem(sectionId, subitems)  // Multiple items, group them
-
-                newSubitems.push(groupedItem)
+                if (item.href === sectionId) {
+                    // Parent already covers this section, keep subitems flat
+                    newSubitems.push(...subitems)
+                    continue
+                }
+                if (subitems.length === 1) {
+                    // Single item, keep as-is
+                    newSubitems.push(subitems[0])
+                } else {
+                    const { parent, fragments } = separateParentAndFragments(sectionId, subitems)
+                    if (parent) {
+                        // Natural parent exists, group fragment items under it
+                        parent.subitems = fragments.length > 0 ? fragments : parent.subitems
+                        newSubitems.push(parent)
+                    } else {
+                        // No natural parent among subitems, keep them flat
+                        newSubitems.push(...subitems)
+                    }
+                }
             }
 
             item.subitems = newSubitems

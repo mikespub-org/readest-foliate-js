@@ -14,26 +14,60 @@ const debounce = (f, wait, immediate) => {
     }
 }
 
-const lerp = (min, max, x) => x * (max - min) + min
-const easeOutQuad = x => 1 - (1 - x) * (1 - x)
-const animate = (a, b, duration, ease, render) => new Promise(resolve => {
-    let start
-    const step = now => {
-        if (document.hidden) {
-            render(lerp(a, b, 1))
-            return resolve()
-        }
-        start ??= now
-        const fraction = Math.min(1, (now - start) / duration)
-        render(lerp(a, b, ease(fraction)))
-        if (fraction < 1) requestAnimationFrame(step)
-        else resolve()
-    }
+// GPU-accelerated scroll animation using CSS transforms
+const animateScroll = (element, scrollProp, startValue, endValue, duration) => new Promise(resolve => {
     if (document.hidden) {
-        render(lerp(a, b, 1))
+        element[scrollProp] = endValue
         return resolve()
     }
-    requestAnimationFrame(step)
+
+    const isHorizontal = scrollProp === 'scrollLeft'
+    const delta = endValue - startValue
+    const content = element.firstElementChild
+    if (!content) {
+        // Fallback if no content element
+        element[scrollProp] = endValue
+        return resolve()
+    }
+
+    // Prepare for animation
+    const transformProp = isHorizontal ? 'translateX' : 'translateY'
+    content.style.willChange = 'transform'
+    content.style.transform = `${transformProp}(0px)`
+    content.style.transition = 'none'
+
+    // Force reflow to apply initial state
+    content.getBoundingClientRect()
+
+    // Start animation
+    content.style.transition = `transform ${duration}ms cubic-bezier(0.25, 0.46, 0.45, 0.94)`
+    content.style.transform = `${transformProp}(${-delta}px)`
+
+    let resolved = false
+    const cleanup = () => {
+        if (resolved) return
+        resolved = true
+
+        content.style.willChange = 'transform'
+        content.style.transform = `${transformProp}(0px)`
+        content.style.transition = 'none'
+
+        // Apply final scroll position
+        element[scrollProp] = endValue
+        resolve()
+    }
+
+    // Listen for transition end
+    const onTransitionEnd = (e) => {
+        if (e.target === content && e.propertyName === 'transform') {
+            content.removeEventListener('transitionend', onTransitionEnd)
+            cleanup()
+        }
+    }
+    content.addEventListener('transitionend', onTransitionEnd)
+
+    // Fallback timeout in case transitionend doesn't fire
+    setTimeout(cleanup, duration + 50)
 })
 
 // collapsed range doesn't return client rects sometimes (or always?)
@@ -306,14 +340,14 @@ class View {
         const doc = this.document
         setStylesImportant(doc.documentElement, {
             'box-sizing': 'border-box',
-            'padding': vertical
-                ? `${marginTop * 1.5}px ${marginRight}px ${marginBottom * 1.5}px ${marginLeft}px`
-                : `${marginTop}px ${gap / 2 + marginRight / 2}px ${marginBottom}px ${gap / 2 + marginLeft / 2}px`,
             'column-width': 'auto',
             'height': 'auto',
             'width': 'auto',
         })
         setStyles(doc.documentElement, {
+            'padding': vertical
+                ? `${marginTop * 1.5}px ${marginRight}px ${marginBottom * 1.5}px ${marginLeft}px`
+                : `${marginTop}px ${gap / 2 + marginRight / 2}px ${marginBottom}px ${gap / 2 + marginLeft / 2}px`,
             '--page-margin-top': `${vertical ? marginTop * 1.5 : marginTop}px`,
             '--page-margin-right': `${vertical ? marginRight : marginRight + gap /2}px`,
             '--page-margin-bottom': `${vertical ? marginBottom * 1.5 : marginBottom}px`,
@@ -343,9 +377,6 @@ class View {
             ...(vertical
                 ? { 'width': `${width}px` }
                 : { 'height': `${height}px` }),
-            'padding': vertical
-                ? `${marginTop * 1.5}px ${marginRight}px ${marginBottom * 1.5}px ${marginLeft}px`
-                : `${marginTop}px ${gap / 2 + marginRight / 2}px ${marginBottom}px ${gap / 2 + marginLeft / 2}px`,
             'overflow': 'hidden',
             // force wrap long words
             'overflow-wrap': 'break-word',
@@ -357,6 +388,9 @@ class View {
             '-webkit-line-box-contain': 'block glyphs replaced',
         })
         setStyles(doc.documentElement, {
+            'padding': vertical
+                ? `${marginTop * 1.5}px ${marginRight}px ${marginBottom * 1.5}px ${marginLeft}px`
+                : `${marginTop}px ${gap / 2 + marginRight / 2}px ${marginBottom}px ${gap / 2 + marginLeft / 2}px`,
             '--page-margin-top': `${vertical ? marginTop * 1.5 : marginTop}px`,
             '--page-margin-right': `${vertical ? marginRight : marginRight / 2 + gap /2}px`,
             '--page-margin-bottom': `${vertical ? marginBottom * 1.5 : marginBottom}px`,
@@ -622,6 +656,7 @@ export class Paginator extends HTMLElement {
     #touchScrolled
     #lastVisibleRange
     #scrollLocked = false
+    #isAnimating = false
     constructor() {
         super()
         this.#root.innerHTML = `<style>
@@ -685,6 +720,18 @@ export class Paginator extends HTMLElement {
             grid-column: 2 / 5;
             grid-row: 1 / -1;
             overflow: hidden;
+            /* GPU acceleration hints for smoother scrolling on high refresh rate displays */
+            transform: translateZ(0);
+            backface-visibility: hidden;
+            -webkit-backface-visibility: hidden;
+            perspective: 1000px;
+            -webkit-perspective: 1000px;
+        }
+        #container > * {
+            /* Ensure child elements are GPU-accelerated for smooth transform animations */
+            transform: translateZ(0);
+            backface-visibility: hidden;
+            -webkit-backface-visibility: hidden;
         }
         :host([flow="scrolled"]) #container {
             grid-column: 2 / 5;
@@ -738,9 +785,12 @@ export class Paginator extends HTMLElement {
         this.#footer = this.#root.getElementById('footer')
 
         this.#observer.observe(this.#container)
-        this.#container.addEventListener('scroll', () => this.dispatchEvent(new Event('scroll')))
+        this.#container.addEventListener('scroll', () => {
+            // Don't dispatch scroll events during animation to prevent jank
+            if (!this.#isAnimating) this.dispatchEvent(new Event('scroll'))
+        })
         this.#container.addEventListener('scroll', debounce(() => {
-            if (this.scrolled) {
+            if (this.scrolled && !this.#isAnimating) {
                 if (this.#justAnchored) this.#justAnchored = false
                 else this.#afterScroll('scroll')
             }
@@ -882,6 +932,7 @@ export class Paginator extends HTMLElement {
         for (let i = 0; i < columnCount; i++) {
             const column = document.createElement('div')
             column.style.background = background
+            column.style.backgroundAttachment = 'initial'
             column.style.width = '100%'
             column.style.height = '100%'
             this.#background.appendChild(column)
@@ -936,6 +987,9 @@ export class Paginator extends HTMLElement {
             this.feet = null
             this.#header.replaceChildren()
             this.#footer.replaceChildren()
+
+            this.columnCount = 1
+            this.#replaceBackground(background, this.columnCount)
 
             return { flow, marginTop, marginRight, marginBottom, marginLeft, gap, columnWidth }
         }
@@ -1037,19 +1091,23 @@ export class Paginator extends HTMLElement {
             this.containerPosition + delta))
     }
 
-    snap(vx, vy) {
+    // vx, vy: velocity at the end of the swipe (pixels per ms)
+    // dx, dy: total distance swiped
+    // dt: total time of the swipe (ms)
+    snap(vx, vy, dx, dy, dt) {
         const velocity = this.#vertical ? vy : vx
+        const avgVelocity = this.#vertical ? dy / dt : dx / dt
         const horizontal = Math.abs(vx) * 2 > Math.abs(vy)
         const orthogonal = this.#vertical ? !horizontal : horizontal
         const [offset, a, b] = this.#scrollBounds
         const { start, end, pages, size } = this
         const min = Math.abs(offset) - a
         const max = Math.abs(offset) + b
-        const d = velocity * (this.#rtl ? -size : size) * (orthogonal ? 1 : 0)
-        const page = Math.floor(
-            Math.max(min, Math.min(max, (start + end) / 2
-                + (isNaN(d) ? 0 : d * 2))) / size)
-
+        const snapping = this.hasAttribute('animated') && !this.hasAttribute('eink')
+        const v =  snapping ? velocity : avgVelocity
+        const d = v * (this.#rtl ? -size : size) * (orthogonal ? 1 : 0)
+        const snapOffset = (isNaN(d) ? 0 : snapping ? d * 2 : d * 10)
+        const page = Math.floor(Math.max(min, Math.min(max, (start + end) / 2 + snapOffset)) / size)
         this.#scrollToPage(page, 'snap').then(() => {
             const dir = page <= 0 ? -1 : page >= pages - 1 ? 1 : null
             if (dir) return this.#goTo({
@@ -1065,6 +1123,11 @@ export class Paginator extends HTMLElement {
             t: e.timeStamp,
             vx: 0, xy: 0,
             dx: 0, dy: 0,
+            dt: 0,
+        }
+        // Hint to browser that scrolling will occur for better GPU layer management
+        if (this.#view?.element) {
+            this.#view.element.style.willChange = 'transform'
         }
     }
     #onTouchMove(e) {
@@ -1095,6 +1158,7 @@ export class Paginator extends HTMLElement {
         state.vy = dy / dt
         state.dx += dx
         state.dy += dy
+        state.dt += dt
         this.#touchScrolled = true
         if (!this.hasAttribute('animated') || this.hasAttribute('eink')) return
         if (!this.#vertical && Math.abs(state.dx) >= Math.abs(state.dy) && !this.hasAttribute('eink') && (!isStylus || Math.abs(dx) > 1)) {
@@ -1104,6 +1168,11 @@ export class Paginator extends HTMLElement {
         }
     }
     #onTouchEnd() {
+        // Remove will-change hint to free GPU resources
+        // if (this.#view?.element) {
+        //     this.#view.element.style.willChange = 'auto'
+        // }
+
         if (!this.#touchScrolled) return
         this.#touchScrolled = false
         if (this.scrolled) return
@@ -1112,8 +1181,10 @@ export class Paginator extends HTMLElement {
         // at this point I'm basically throwing `requestAnimationFrame` at
         // anything that doesn't work
         requestAnimationFrame(() => {
-            if (globalThis.visualViewport.scale === 1)
-                this.snap(this.#touchState.vx, this.#touchState.vy)
+            if (globalThis.visualViewport.scale === 1) {
+                const { vx, vy, dx, dy, dt } = this.#touchState
+                this.snap(vx, vy, dx, dy, dt)
+            }
         })
     }
     // allows one to process rects as if they were LTR and horizontal
@@ -1152,14 +1223,22 @@ export class Paginator extends HTMLElement {
         }
         // FIXME: vertical-rl only, not -lr
         if (this.scrolled && this.#vertical) offset = -offset
-        if ((reason === 'snap' || smooth) && this.hasAttribute('animated') && !this.hasAttribute('eink')) return animate(
-            this.containerPosition, offset, 300, easeOutQuad,
-            x => this.containerPosition = x,
-        ).then(() => {
-            this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
-            this.#afterScroll(reason)
-        })
-        else {
+        if ((reason === 'snap' || smooth) && this.hasAttribute('animated') && !this.hasAttribute('eink')) {
+            const startPosition = this.containerPosition
+            // Use GPU-accelerated scroll animation for smoother experience on high refresh rate screens
+            this.#isAnimating = true
+            return animateScroll(
+                this.#container,
+                this.scrollProp,
+                startPosition,
+                offset,
+                300,
+            ).then(() => {
+                this.#isAnimating = false
+                this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
+                this.#afterScroll(reason)
+            })
+        } else {
             this.containerPosition = offset
             this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
             this.#afterScroll(reason)
@@ -1212,6 +1291,7 @@ export class Paginator extends HTMLElement {
         await this.#scrollToPage(newPage + 1, reason)
     }
     #getVisibleRange() {
+        if (!this.#view.document) return
         if (this.scrolled) return getVisibleRange(this.#view.document,
             this.start, this.end, this.#getRectMapper())
         const size = this.#rtl ? -this.size : this.size
@@ -1220,6 +1300,7 @@ export class Paginator extends HTMLElement {
     }
     #afterScroll(reason) {
         const range = this.#getVisibleRange()
+        if (!range) return
         this.#lastVisibleRange = range
         // don't set new anchor if relocation was to scroll to anchor
         if (reason !== 'selection' && reason !== 'navigation' && reason !== 'anchor')
