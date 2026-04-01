@@ -391,7 +391,7 @@ export class View extends HTMLElement {
                     return
                 }
                 const range = doc ? anchor(doc) : anchor
-                overlayer.add(value, range, Overlayer.outline)
+                if (range) overlayer.add(value, range, Overlayer.outline)
             }
             return
         } else if (value.startsWith(NOTE_PREFIX)) {
@@ -405,8 +405,10 @@ export class View extends HTMLElement {
                     return
                 }
                 const range = doc ? anchor(doc) : anchor
-                const draw = (func, opts) => overlayer.add(value, range, func, opts)
-                this.#emit('draw-annotation', { draw, annotation, doc, range })
+                if (range) {
+                    const draw = (func, opts) => overlayer.add(value, range, func, opts)
+                    this.#emit('draw-annotation', { draw, annotation, doc, range })
+                }
             }
             return
         }
@@ -417,11 +419,13 @@ export class View extends HTMLElement {
             overlayer.remove(value)
             if (!remove) {
                 const range = doc ? anchor(doc) : anchor
-                const draw = (func, opts) => overlayer.add(value, range, func, opts)
-                this.#emit('draw-annotation', { draw, annotation, doc, range })
+                if (range) {
+                    const draw = (func, opts) => overlayer.add(value, range, func, opts)
+                    this.#emit('draw-annotation', { draw, annotation, doc, range })
+                }
             }
         }
-        const label = this.#tocProgress.getProgress(index)?.label ?? ''
+        const label = this.#tocProgress?.getProgress(index)?.label ?? ''
         return { index, label }
     }
     deleteAnnotation(annotation) {
@@ -554,7 +558,7 @@ export class View extends HTMLElement {
             const isRange = frag instanceof Range
             const range = isRange ? frag : doc.createRange()
             if (!isRange) range.selectNodeContents(frag)
-            return this.#tocProgress.getProgress(index, range)
+            return this.#tocProgress?.getProgress(index, range)
         } catch(e) {
             console.error(e)
             console.error(`Could not get ${target}`)
@@ -633,7 +637,7 @@ export class View extends HTMLElement {
                 for (const item of list) this.addAnnotation(item)
                 yield {
                     index: result.index,
-                    label: this.#tocProgress.getProgress(result.index)?.label ?? '',
+                    label: this.#tocProgress?.getProgress(result.index)?.label ?? '',
                     subitems: result.subitems,
                 }
             }
@@ -654,14 +658,21 @@ export class View extends HTMLElement {
         this.#searchResults.clear()
     }
     async initTTS(granularity = 'word', nodeFilter, highlighter) {
-        const doc = this.renderer.getContents()[0].doc
+        const contents = this.renderer.getContents()
+        const primaryIndex = this.renderer.primaryIndex
+        const primary = contents.find(x => x.index === primaryIndex) ?? contents[0]
+        const doc = primary?.doc
+        if (!doc) return
         if (this.tts && this.tts.doc === doc) return
         const { TTS } = await import('./tts.js')
         this.tts = new TTS(doc, textWalker, nodeFilter, highlighter || (range =>
             this.renderer.scrollToAnchor(range, true)), granularity)
     }
     startMediaOverlay() {
-        const { index } = this.renderer.getContents()[0]
+        const contents = this.renderer.getContents()
+        const primaryIndex = this.renderer.primaryIndex
+        const primary = contents.find(x => x.index === primaryIndex) ?? contents[0]
+        const { index } = primary ?? {}
         return this.mediaOverlay.start(index)
     }
 }

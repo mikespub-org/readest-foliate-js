@@ -585,12 +585,37 @@ class MediaOverlay extends EventTarget {
     }
 }
 
-const isUUID = /([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})/
+const isUUID = /([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})/i
 
 const getUUID = opf => {
-    for (const el of opf.getElementsByTagNameNS(NS.DC, 'identifier')) {
-        const [id] = getElementText(el).split(':').slice(-1)
-        if (isUUID.test(id)) return id
+    const extractUUID = el => {
+        const text = getElementText(el)
+        const id = text.split(':').slice(-1)[0]
+        const match = isUUID.exec(id)
+        return match ? match[0] : null
+    }
+    const identifiers = Array.from(opf.getElementsByTagNameNS(NS.DC, 'identifier'))
+    // 1. Prefer the unique-identifier (used by Adobe font obfuscation)
+    const uniqueIdAttr = opf.documentElement.getAttribute('unique-identifier')
+    if (uniqueIdAttr) {
+        const el = identifiers.find(el => el.getAttribute('id') === uniqueIdAttr)
+        if (el) {
+            const uuid = extractUUID(el)
+            if (uuid) return uuid
+        }
+    }
+    // 2. Prefer urn:uuid: identifiers (standard UUID URN per RFC 4122)
+    for (const el of identifiers) {
+        const text = getElementText(el)
+        if (/^urn:uuid:/i.test(text)) {
+            const uuid = extractUUID(el)
+            if (uuid) return uuid
+        }
+    }
+    // 3. Fall back to any identifier containing a UUID
+    for (const el of identifiers) {
+        const uuid = extractUUID(el)
+        if (uuid) return uuid
     }
     return ''
 }
@@ -1104,6 +1129,7 @@ ${doc.querySelector('parsererror').innerText}`)
                 size: this.getSize(item.href),
                 cfi: this.resources.cfis[index],
                 linear,
+                spineProperties: properties,
                 pageSpread: getPageSpread(properties),
                 resolveHref: href => resolveURL(href, item.href),
                 mediaOverlay: item.mediaOverlay
@@ -1181,30 +1207,14 @@ ${doc.querySelector('parsererror').innerText}`)
             return { parent, fragments }
         }
 
-        // Helper: Create grouped structure for multiple items in same section
-        const createGroupedItem = (sectionId, subitems) => {
-            const { parent, fragments } = separateParentAndFragments(sectionId, subitems)
-
-            // Use existing parent or create new one
-            const parentItem = parent ?? {
-                label: subitems[0].label || sectionId,
-                href: sectionId,
-            }
-
-            // Nest fragment items under parent
-            if (fragments.length > 0) {
-                parentItem.subitems = fragments
-            }
-
-            return parentItem
-        }
-
         for (const item of items) {
             if (!item.subitems?.length) continue
 
             const groupedBySection = groupBySection(item.subitems)
-            const newSubitems = []
+            // heuristic: only regroup if there are multiple items per section
+            if (groupedBySection.size <= 3) continue
 
+            const newSubitems = []
             for (const [sectionId, subitems] of groupedBySection.entries()) {
                 if (item.href === sectionId) {
                     // Parent already covers this section, keep subitems flat
@@ -1226,7 +1236,6 @@ ${doc.querySelector('parsererror').innerText}`)
                     }
                 }
             }
-
             item.subitems = newSubitems
         }
     }
