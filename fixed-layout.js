@@ -60,6 +60,23 @@ export const restoreScrollModeAnchor = (pages, anchor, maxScrollTop) => {
     return clamp(page.top + page.height * anchor.fraction, 0, maxScrollTop)
 }
 
+export const scrollGapToCss = (value) => {
+    const n = parseFloat(value)
+    return Number.isFinite(n) && n >= 0 ? `${n}px` : null
+}
+
+// Scroll offsets to apply to the host (`overflow:auto`) after rendering a
+// paginated page. Horizontal is always re-centered so the page sits in the
+// middle of the viewport. Vertical is reset to the top only on a page turn:
+// a tall fit-width page overflows the host vertically, and without the reset the
+// freshly-shown page inherits the previous page's offset and opens scrolled to
+// the bottom (#4683). Plain re-renders (resize, zoom, theme) keep the reader's
+// current vertical position within the page.
+export const computePaginatedScroll = ({ elementWidth, containerWidth, scrollTop, pageTurn }) => ({
+    scrollLeft: (elementWidth - containerWidth) / 2,
+    scrollTop: pageTurn ? 0 : scrollTop,
+})
+
 // Align the SVG overlayer's coord system with the iframe's unscaled content.
 // When the iframe is visually scaled via CSS transform (non-PDF path),
 // getClientRects() inside the iframe returns positions in the iframe's native
@@ -83,7 +100,7 @@ export const applyOverlayerViewBox = (frame, overlayer) => {
 }
 
 export class FixedLayout extends HTMLElement {
-    static observedAttributes = ['zoom', 'scale-factor', 'spread', 'flow']
+    static observedAttributes = ['zoom', 'scale-factor', 'spread', 'flow', 'scroll-gap']
     #root = this.attachShadow({ mode: 'open' })
     #observer = new ResizeObserver(() => this.#render())
     #spreads
@@ -182,7 +199,7 @@ export class FixedLayout extends HTMLElement {
             position: relative;
             flex-shrink: 0;
             overflow: hidden;
-            margin: 4px 0;
+            margin: var(--scroll-page-gap, 4px) 0;
         }
         :host([flow="scrolled"]) .scroll-page iframe {
             pointer-events: none;
@@ -216,6 +233,14 @@ export class FixedLayout extends HTMLElement {
                     this.#render()
                 }
                 break
+            case 'scroll-gap': {
+                const css = scrollGapToCss(value)
+                const anchor = this.#scrollMode ? this.#captureScrollModeAnchor() : null
+                if (css === null) this.style.removeProperty('--scroll-page-gap')
+                else this.style.setProperty('--scroll-page-gap', css)
+                if (anchor) this.#restoreScrollModeAnchor(anchor)
+                break
+            }
         }
     }
     async #createFrame({ index, src: srcOption, detached = false }) {
@@ -270,7 +295,7 @@ export class FixedLayout extends HTMLElement {
             }
         })
     }
-    #render(side = this.#side) {
+    #render(side = this.#side, pageTurn = false) {
         if (this.#scrollMode) {
             this.#renderScrollMode()
             return []
@@ -372,7 +397,14 @@ export class FixedLayout extends HTMLElement {
             if (!container) return
             const containerWidth = container.clientWidth
             const containerHeight = container.clientHeight
-            container.scrollLeft = (element.clientWidth - containerWidth) / 2
+            const { scrollLeft, scrollTop } = computePaginatedScroll({
+                elementWidth: element.clientWidth,
+                containerWidth,
+                scrollTop: container.scrollTop,
+                pageTurn,
+            })
+            container.scrollLeft = scrollLeft
+            container.scrollTop = scrollTop
 
             return {
                 width: element.clientWidth,
@@ -448,8 +480,9 @@ export class FixedLayout extends HTMLElement {
 
         // Render layout and await any async onZoom callbacks (e.g. PDF text
         // layer rendering) so the document is fully populated before overlayers
-        // try to resolve CFIs against it.
-        const renderPromises = this.#render()
+        // try to resolve CFIs against it. Pass pageTurn so a tall fit-width page
+        // starts at the top instead of inheriting the previous page's scroll.
+        const renderPromises = this.#render(this.#side, true)
         if (renderPromises.length) await Promise.all(renderPromises)
 
         const showingFrames = center
@@ -689,13 +722,18 @@ export class FixedLayout extends HTMLElement {
                         },
                     },
                 }))
-                // Forward wheel events to host when iframe has pointer-events
-                // (fallback for the brief window after scroll settles)
-                doc.addEventListener('wheel', e => {
-                    // Disable pointer-events immediately so subsequent
-                    // wheel ticks use native scroll
+                // During the brief idle window after scrolling settles the
+                // iframe is interactive (pointer-events: auto), so the first
+                // wheel tick of a new gesture lands on it. The browser already
+                // chains that tick to the host scroller natively (a single
+                // smooth scroll, matching the page margins) — so we must NOT
+                // scroll the host ourselves here, or the manual scroll stacks
+                // on top of the native one and the page jumps twice as far in
+                // an instant lurch (readest#4727). Just drop pointer-events so
+                // the iframe stops intercepting and the rest of the gesture
+                // scrolls the host natively too.
+                doc.addEventListener('wheel', () => {
                     this.#setScrollIframeInteraction(false)
-                    this.scrollBy({ top: e.deltaY, left: e.deltaX, behavior: 'instant' })
                 }, { passive: true })
             }
         } catch (e) {
@@ -813,7 +851,7 @@ export class FixedLayout extends HTMLElement {
         if (this.#center || this.#left?.blank) return
         if (this.#portrait && this.#left?.element?.style?.display === 'none') {
             this.#side = 'left'
-            this.#render()
+            this.#render(this.#side, true)
             this.#reportLocation('page')
             return true
         }
@@ -822,7 +860,7 @@ export class FixedLayout extends HTMLElement {
         if (this.#center || this.#right?.blank) return
         if (this.#portrait && this.#right?.element?.style?.display === 'none') {
             this.#side = 'right'
-            this.#render()
+            this.#render(this.#side, true)
             this.#reportLocation('page')
             return true
         }

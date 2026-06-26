@@ -347,8 +347,15 @@ export const computeBackgroundSegments = (views, scrollPos, bgSize, inset, conta
 // and the resolved colour otherwise. Shared by scrolled-mode view elements and
 // paginated-mode segments so both modes treat textures identically (readest#4399).
 export const textureAwareBackground = (resolved, hasTexture) => {
-    const isTransparent = !resolved
-        || /^\s*(transparent|rgba\(0,\s*0,\s*0,\s*0\))/.test(resolved)
+    // A page that paints an image (e.g. a cover set via body `background-image`)
+    // is NOT transparent — it should occlude the texture, not be dropped. The
+    // computed `background` shorthand always serializes the transparent
+    // background-*color* first (`rgba(0, 0, 0, 0) url(...) ...`), so the
+    // colour-prefix check below would otherwise misclassify a cover as
+    // transparent and hide it behind the texture (verified on Android WebView).
+    const hasImage = /\burl\(/i.test(resolved ?? '')
+    const isTransparent = !hasImage && (!resolved
+        || /^\s*(transparent|rgba\(0,\s*0,\s*0,\s*0\))/.test(resolved))
     return hasTexture && isTransparent ? '' : resolved
 }
 
@@ -603,7 +610,34 @@ class View {
             'position': 'static',
         })
         this.setImageSize(availableWidth, availableHeight)
+        this.#demoteUnfragmentableBoxes(availableHeight)
         this.expand()
+    }
+    // Atomic inline-level boxes (inline-block / inline-flex / inline-grid /
+    // inline-table) cannot be fragmented across columns. When an EPUB declares
+    // such a display on a tall block container, the box overflows the page and
+    // every column past the first is clipped, so whole sections silently vanish
+    // (e.g. a chapter that jumps straight to its references). Detect the
+    // vertical overflow this causes in paginated mode and demote the offending
+    // boxes to their fragmentable block-level equivalents so the content
+    // paginates normally. The querySelectorAll scan only runs when the document
+    // actually overflows its column, which is the (rare) bug case.
+    #demoteUnfragmentableBoxes(availableHeight) {
+        const doc = this.document
+        const root = doc?.documentElement
+        if (!root || root.scrollHeight <= root.clientHeight + 1) return
+        const view = doc.defaultView
+        const fragmentable = {
+            'inline-block': 'block',
+            'inline-flex': 'flex',
+            'inline-grid': 'grid',
+            'inline-table': 'table',
+        }
+        for (const el of doc.body.querySelectorAll('*')) {
+            const replacement = fragmentable[view.getComputedStyle(el).display]
+            if (replacement && el.getBoundingClientRect().height > availableHeight)
+                setStylesImportant(el, { display: replacement })
+        }
     }
     setImageSize(availableWidth, availableHeight) {
         const { width, height, marginTop, marginRight, marginBottom, marginLeft } = this.#layout
@@ -651,6 +685,10 @@ class View {
                     width: '100%',
                     height: '100%',
                     margin: '0',
+                    // stretch edge-to-edge, ignoring aspect ratio, so the cover
+                    // fills the whole page like Duokan's native full-page render
+                    // (overrides the 'contain' set for all images above)
+                    'object-fit': 'fill',
                 })
                 let ancestor = el.parentElement
                 while (ancestor && ancestor !== doc.body) {
@@ -663,7 +701,7 @@ class View {
                     ancestor = ancestor.parentElement
                 }
                 if (el.localName === 'svg') {
-                    el.setAttribute('preserveAspectRatio', 'xMidYMid meet')
+                    el.setAttribute('preserveAspectRatio', 'none')
                 }
             } else if (pageFullscreen) {
                 // Scrolled mode for a fullscreen-cover doc: undo any absolute
@@ -1042,12 +1080,32 @@ export class Paginator extends HTMLElement {
         #container.vertical {
             flex-direction: column;
         }
+        /* Apple WebKit (iOS/macOS) composites large, persistent layers without
+           the ~1s Blink freeze Android Chromium hits at high DPR (the reason
+           these promotion hints were dropped and rafAnimateScroll was added).
+           When the host opts in, restore persistent compositor layers for the
+           container and each view so the GPU cssAnimateScroll page-turn stays
+           smooth on 120Hz ProMotion instead of promoting a layer on-demand
+           every turn (readest#4768). Paginated mode only; scrolled mode does
+           its own compositing below. */
+        :host([gpu-composite]:not([flow="scrolled"])) #container,
+        :host([gpu-composite]:not([flow="scrolled"])) #container > * {
+            transform: translateZ(0);
+        }
         :host([flow="scrolled"]) #container {
             grid-column: 2 / 5;
             grid-row: 1 / -1;
             overflow: auto;
             overflow-anchor: auto;
             flex-direction: column;
+            /* Composite the scroll container so its scrollbar repaints on the
+               compositor thread; the main-thread scrollbar fails to
+               re-invalidate after content-size changes (adjacent-section
+               preloading right after open), so on Windows' always-on
+               scrollbars it vanishes shortly after the book opens
+               (readest#4470). Scoped to scrolled mode to leave the paginated
+               page-turn path un-composited. */
+            transform: translateZ(0);
         }
         :host([flow="scrolled"]) #container.vertical {
             flex-direction: row;
@@ -1687,6 +1745,13 @@ export class Paginator extends HTMLElement {
     }
 
     scrollBy(dx, dy) {
+        // #scrollBounds is populated by #scrollToPage and stays unset until
+        // the first page settles. A swipe that lands before that happens
+        // (for example a fast swipe right after the reader mounts, or
+        // before a section has finished loading) would otherwise blow up
+        // on the destructuring below — bail out and let the next settled
+        // scroll re-enable swipe-driven motion.
+        if (!this.#scrollBounds) return
         const delta = this.#vertical ? dy : dx
         const [offset, a, b] = this.#scrollBounds
         const rtl = this.#rtl
@@ -1700,6 +1765,11 @@ export class Paginator extends HTMLElement {
     // dx, dy: total distance swiped
     // dt: total time of the swipe (ms)
     snap(vx, vy, dx, dy, dt) {
+        // Same guard as scrollBy: an early swipe whose touchend fires
+        // before the first #scrollToPage seeds #scrollBounds would crash
+        // on the destructuring. Skip the snap; the next settled scroll
+        // populates the bounds and subsequent swipes work normally.
+        if (!this.#scrollBounds) return
         const velocity = this.#vertical ? vy : vx
         const avgVelocity = this.#vertical ? dy / dt : dx / dt
         const horizontal = Math.abs(vx) * 2 > Math.abs(vy)
@@ -1872,8 +1942,12 @@ export class Paginator extends HTMLElement {
             // For a large section the CSS-transform animation blocks the UI while
             // Blink composites the oversized layer; animate the native scroll
             // offset instead (incremental/tiled, like a swipe), keeping the
-            // per-page backgrounds synced each frame.
-            if (this.#renderedViewSize > RAF_ANIMATE_SCROLL_THRESHOLD) {
+            // per-page backgrounds synced each frame. Hosts that composite large
+            // layers without that freeze (Apple WebKit, via the gpu-composite
+            // opt-in) skip this main-thread fallback and keep the smooth GPU
+            // cssAnimateScroll path even for large sections (readest#4768).
+            if (!this.hasAttribute('gpu-composite')
+                && this.#renderedViewSize > RAF_ANIMATE_SCROLL_THRESHOLD) {
                 return rafAnimateScroll(startPosition, offset, 300, easeOutQuad, x => {
                     this.#container[this.scrollProp] = x
                     if (!this.scrolled) this.#replaceBackground()
@@ -1999,9 +2073,18 @@ export class Paginator extends HTMLElement {
         if (!targetView?.document) return
         const viewOffset = this.#getViewOffset(this.#primaryIndex)
         if (this.scrolled) {
-            // In scrolled mode, the primary view may be scrolled out of
-            // the viewport at a section boundary. Try all visible views
-            // and return the first valid (non-collapsed) range.
+            // In scrolled mode several sections can share the viewport at a
+            // section boundary, and the primary view may even be scrolled out
+            // of view. Prefer the view that covers the viewport centre — that
+            // is the section the reader is actually reading, so its title is
+            // the one to show. Falling back to the first overlapping view (the
+            // old behaviour) would report a thin sliver at the top edge, whose
+            // chapter title no longer matches the dominant content
+            // (readest#4436). Keep that first valid range as a fallback for
+            // when no loaded view covers the centre (e.g. at the very top or
+            // bottom of the book).
+            const center = this.#renderedStart + this.size / 2
+            let fallback
             for (const [index, v] of this.#sortedViews) {
                 if (!v.document) continue
                 const off = this.#getViewOffset(index)
@@ -2011,9 +2094,11 @@ export class Paginator extends HTMLElement {
                 const range = getVisibleRange(v.document,
                     this.#renderedStart - off, this.#renderedEnd - off,
                     this.#getRectMapper(v))
-                if (range && !range.collapsed) return { range, index }
+                if (!range || range.collapsed) continue
+                if (center >= off && center < off + vSize) return { range, index }
+                fallback ??= { range, index }
             }
-            return
+            return fallback
         }
         const range = getVisibleRange(targetView.document,
             this.#renderedStart - viewOffset,
@@ -2102,9 +2187,13 @@ export class Paginator extends HTMLElement {
         const primaryView = this.#primaryView
         const detail = { reason, range, index }
         if (this.scrolled) {
+            // The relocated index may differ from #primaryIndex (the centre of
+            // the viewport can sit in a different view than its top edge), so
+            // size the fraction against the relocated view to keep it in sync.
+            const indexView = this.#views.get(index) ?? primaryView
             const primaryOffset = this.#getViewOffset(index)
-            const primarySize = primaryView
-                ? primaryView.element.getBoundingClientRect()[this.sideProp] : this.#renderedViewSize
+            const primarySize = indexView
+                ? indexView.element.getBoundingClientRect()[this.sideProp] : this.#renderedViewSize
             detail.fraction = primarySize > 0
                 ? Math.max(0, Math.min(1, (this.#renderedStart - primaryOffset) / primarySize)) : 0
         } else if (this.#renderedPages > 0 && primaryView) {

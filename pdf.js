@@ -160,6 +160,16 @@ const render = async (page, doc, zoom, pageColors) => {
     const canvas = document.createElement('canvas')
     canvas.height = viewport.height
     canvas.width = viewport.width
+    // `canvas.width`/`canvas.height` are the bitmap size and must be integers,
+    // so the fractional `viewport.{width,height}` (= pageSizeCss *
+    // devicePixelRatio) is truncated. The iframe content is displayed scaled by
+    // `1 / devicePixelRatio` (see the `documentElement` transform above), so a
+    // truncated bitmap renders up to ~1 device pixel narrower than the page box,
+    // leaving a one-pixel white seam at the spine of a two-page spread (#4587).
+    // Pin an explicit CSS size to the un-truncated viewport dimensions so the
+    // bitmap scales to fill the page box exactly.
+    canvas.style.width = `${viewport.width}px`
+    canvas.style.height = `${viewport.height}px`
     const canvasContext = canvas.getContext('2d')
     const renderTask = page.render({ canvasContext, viewport, pageColors })
     activeRenderTasks.set(doc, renderTask)
@@ -347,12 +357,33 @@ const parseCalibreSeriesFromXMP = raw => {
     return position ? { name, position } : { name }
 }
 
+// Maximum number of range reads to keep in flight at once. While parsing a
+// large PDF's cross-reference and object streams, pdf.js can request hundreds
+// of byte ranges in a single burst. A real HTTP transport is implicitly
+// throttled by the browser's per-host connection limit (~6); the custom file
+// schemes readest serves these reads through (Android's `rangefile` /
+// `shouldInterceptRequest`, iOS' native file bridge) have no such limit, so
+// firing every request at once floods the native handler and exhausts the
+// WebView's heap, crashing on 50 MB+ PDFs (readest #3470). Throttle here.
+const MAX_CONCURRENT_RANGES = 6
+
 export const makePDF = async file => {
     const transport = new pdfjsLib.PDFDataRangeTransport(file.size, [])
+    // Bound the concurrent range reads instead of dispatching them all at once.
+    let active = 0
+    const queue = []
+    const pump = () => {
+        while (active < MAX_CONCURRENT_RANGES && queue.length) {
+            const [begin, end] = queue.shift()
+            active++
+            file.slice(begin, end).arrayBuffer()
+                .then(chunk => transport.onDataRange(begin, chunk))
+                .finally(() => { active--; pump() })
+        }
+    }
     transport.requestDataRange = (begin, end) => {
-        file.slice(begin, end).arrayBuffer().then(chunk => {
-            transport.onDataRange(begin, chunk)
-        })
+        queue.push([begin, end])
+        pump()
     }
     const pdf = await pdfjsLib.getDocument({
         range: transport,
