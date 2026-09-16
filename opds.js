@@ -216,9 +216,9 @@ export const getPublication = entry => {
             author: children.filter(filter('author')).map(getPerson),
             contributor: children.filter(filter('contributor')).map(getPerson),
             publisher: children.find(filterDC('publisher'))?.textContent ?? undefined,
-            published: (children.find(filter('published'))
-                ?? children.find(filterDCTERMS('issued'))
-                ?? children.find(filterDC('date')))?.textContent ?? undefined,
+            published: (children.find(filterDCTERMS('issued'))
+                ?? children.find(filterDC('date'))
+                ?? children.find(filter('published')))?.textContent ?? undefined,
             language: children.find(filterDC('language'))?.textContent ?? undefined,
             identifier: children.find(filterDC('identifier'))?.textContent ?? undefined,
             subject: children.filter(filter('category')).map(category => ({

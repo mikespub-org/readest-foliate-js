@@ -23,6 +23,39 @@ const MIME = {
     JS: /\/(x-)?(javascript|ecmascript)/,
 }
 
+// a document declared XHTML that the XML parser could not parse
+const isBrokenXHTML = doc => doc.querySelector('parsererror')
+    || !doc.documentElement?.namespaceURI
+// Void elements that Adobe InDesign / Digital Editions exports leave unclosed
+// (`<meta charset="utf-8">` constantly), the usual reason such a file is not
+// well-formed XML. Lowercase only: XHTML is case-sensitive, and an uppercase
+// `<BR>` closed as `<BR/>` would parse as an unknown element instead of a
+// line break, so those files keep taking the HTML path.
+const VOID_ELEMENT_RE = /<(meta|link|br|img|hr|input|col|area|base|embed|param|source|track|wbr)(?=[\s/>])((?:[^<>"']|"[^"]*"|'[^']*')*)>/g
+const closeVoidElements = str => str.replace(VOID_ELEMENT_RE,
+    (tag, name, attrs) => attrs.trimEnd().endsWith('/') ? tag : `<${name}${attrs}/>`)
+// Parse a content document. A file the manifest declares as XHTML but which
+// is not well-formed XML first gets its unclosed void elements closed and is
+// parsed as XML again; only if that still fails is it parsed as HTML. The
+// HTML parser is not a faithful reading of such a file: it ignores `/>` on
+// non-void elements and re-opens formatting elements across blocks, so an
+// `<a id="page_25"/>` at the top of a paragraph swallows every following
+// `<p>` until the next anchor, and positions (CFIs, other readers' locators)
+// stop matching the book's real structure. Shared by the render path
+// (`loadReplaced`) and the off-screen path (`loadDocument`) so both see the
+// same DOM.
+const parseContentDocument = (parser, str, mediaType) => {
+    let doc = parser.parseFromString(str, mediaType)
+    if (mediaType !== MIME.XHTML || !isBrokenXHTML(doc)) return { doc, mediaType }
+    const repaired = closeVoidElements(str)
+    if (repaired !== str) {
+        doc = parser.parseFromString(repaired, mediaType)
+        if (!isBrokenXHTML(doc)) return { doc, mediaType }
+    }
+    console.warn(doc.querySelector('parsererror')?.innerText ?? 'Invalid XHTML')
+    return { doc: parser.parseFromString(str, MIME.HTML), mediaType: MIME.HTML }
+}
+
 // https://www.w3.org/TR/epub-33/#sec-reserved-prefixes
 const PREFIX = {
     a11y: 'http://www.idpf.org/epub/vocab/package/a11y/#',
@@ -92,16 +125,28 @@ const childGetter = (doc, ns) => {
     }
 }
 
+// Zip entry names are raw, so a resolved href has to be fully decoded to match
+// one. `decodeURI()` can't do it: by spec it preserves the reserved set
+// (`; / ? : @ & = + $ , #`), leaving an entry named `a&b.html` unreachable
+// behind its manifest href `a%26b.html`. Decode as a component instead, keeping
+// only `/` and `#` encoded, which would otherwise turn into a path or fragment
+// separator. Malformed escapes (a bare `%` in a name) decode to themselves.
+const decodeURIPath = path => {
+    try {
+        return decodeURIComponent(path.replace(/%(2f|23)/gi, '%25$1'))
+    } catch {
+        return path
+    }
+}
+
 const resolveURL = (url, relativeTo) => {
     try {
-        // replace %2c in the url with a comma, this might be introduced by calibre
-        url = url.replace(/%2c/gi, ',').replace(/%3a/gi, ':')
-        if (relativeTo.includes(':') && !relativeTo.startsWith('OEBPS')) return new URL(url, relativeTo)
+        if (isExternal(relativeTo)) return new URL(url, relativeTo)
         // the base needs to be a valid URL, so set a base URL and then remove it
         const root = 'https://invalid.invalid/'
         const obj = new URL(url, root + relativeTo)
         obj.search = ''
-        return decodeURI(obj.href.replace(root, ''))
+        return decodeURIPath(obj.href.replace(root, ''))
     } catch(e) {
         console.warn(e)
         return url
@@ -170,6 +215,47 @@ const getPropertyURL = (value, prefixes) => {
     const reference = b ? b : a
     const baseURL = prefixes.get(prefix)
     return baseURL ? baseURL + reference : null
+}
+
+// See the call site in getMetadata() for the two calibre encodings this reads.
+const getCalibreUserMetadata = (metaEls, legacyMeta) => {
+    // calibre's to_json wraps non-JSON types; only datetime appears in columns
+    const fromJSON = x => x?.__class__ === 'datetime.datetime' ? x.__value__ : x
+    const isEmpty = (value, datatype) => value == null || value === ''
+        || Array.isArray(value) && !value.length
+        // calibre can't distinguish these from unset, and neither can we
+        || datatype === 'datetime' && String(value).startsWith('0101-01-01')
+        || datatype === 'rating' && !value
+    const columns = []
+    const add = (key, fm) => {
+        if (!key?.startsWith('#') || typeof fm !== 'object' || !fm) return
+        const datatype = fm.datatype ?? 'text'
+        const value = fromJSON(fm['#value#'])
+        if (isEmpty(value, datatype)) return
+        const extra = fromJSON(fm['#extra#'])
+        const label = key.slice(1)
+        columns.push({
+            label,
+            name: typeof fm.name === 'string' && fm.name ? fm.name : label,
+            datatype, value,
+            ...extra != null ? { extra } : {},
+        })
+    }
+    for (const el of metaEls ?? []) {
+        if (el.getAttribute('property')?.toLowerCase() !== 'calibre:user_metadata') continue
+        try {
+            for (const [key, fm] of Object.entries(JSON.parse(getElementText(el))))
+                add(key, fm)
+        } catch {}
+    }
+    if (!columns.length)
+        for (const [name, content] of Object.entries(legacyMeta ?? {})) {
+            if (!name.startsWith('calibre:user_metadata:')) continue
+            try {
+                add(name.slice('calibre:user_metadata:'.length), JSON.parse(content))
+            } catch {}
+        }
+    return columns.length ? columns : null
 }
 
 const getMetadata = opf => {
@@ -307,6 +393,19 @@ const getMetadata = opf => {
     tidy(metadata)
     if (metadata.altIdentifier === metadata.identifier)
         delete metadata.altIdentifier
+    // Calibre embeds its custom columns ("user metadata") when polishing or
+    // sending books. Two encodings (see calibre's opf2.py/opf3.py):
+    //   OPF 2: <meta name="calibre:user_metadata:#label" content="{json}"/> per column
+    //   OPF 3: a single <meta property="calibre:user_metadata"> whose text is
+    //          a JSON dict of all columns keyed by "#label"; calibre prefers
+    //          this form over the legacy metas when both are present
+    // The column value lives in `#value#` (series index in `#extra#`);
+    // datetimes are wrapped as {"__class__": "datetime.datetime",
+    // "__value__": <ISO>} with 0101-01-01 meaning unset. Embedded files carry
+    // every column of the library, so empty values are dropped here. Must run
+    // after tidy(), which would otherwise collapse single-element value arrays.
+    const calibreColumns = getCalibreUserMetadata(els.meta, legacyMeta)
+    if (calibreColumns) metadata.calibreColumns = calibreColumns
 
     const rendition = {}
     const media = {}
@@ -411,6 +510,7 @@ const getImageMediaType = (path) => {
         'png': 'image/png',
         'gif': 'image/gif',
         'webp': 'image/webp',
+        'svg': 'image/svg+xml',
     }
     return mediaTypeMap[extension] || 'image/jpeg'
 }
@@ -424,6 +524,19 @@ const getFontMediaType = (path) => {
         'otf': 'font/otf',
     }
     return mediaTypeMap[extension] || 'font/ttf'
+}
+
+// Container entry whose file name ends in `cover`/`couv` (the French
+// spelling) plus an image extension, e.g. `cover.jpg`, `Images/Cover.PNG`,
+// `couv.jpeg`. Same shape `gnome-epub-thumbnailer` falls back to.
+const UNDECLARED_COVER_RE = /(?:cover|couv)\.(?:jpe?g|png|gif|webp|svg)$/i
+
+// Last-ditch cover lookup for EPUBs where the manifest resolves to nothing:
+// scan the container's own file names. `names` is iterated in central
+// directory order, so the first match wins.
+const findUndeclaredCover = names => {
+    for (const name of names) if (UNDECLARED_COVER_RE.test(name)) return name
+    return null
 }
 
 class MediaOverlay extends EventTarget {
@@ -805,6 +918,19 @@ class Loader {
         return url
     }
     ref(href, parent) {
+        // A top-level load -- a view opening a section -- has no parent
+        // document to hang the reference on, and is released by exactly one
+        // `unloadItem`, so it must always be counted. Recording it under an
+        // absent parent instead put every top-level load in the book into one
+        // shared `#children` bucket that nothing ever cleared, so the second
+        // view to open an already-loaded section (a footnote popup, which
+        // opens another view on the same book) skipped its increment yet still
+        // decremented on close. The count underflowed to zero and revoked the
+        // section along with its images while a view was still showing them.
+        if (!parent) {
+            this.#refCount.set(href, this.#refCount.get(href) + 1)
+            return this.#cache.get(href)
+        }
         const childList = this.#children.get(parent)
         if (!childList?.includes(href)) {
             this.#refCount.set(href, this.#refCount.get(href) + 1)
@@ -857,7 +983,11 @@ class Loader {
         return this.createURL(href, tryLoadBlob, mediaType, parent)
     }
     async loadItemXHTMLContent(item, parents = []) {
-        const url = await this.loadItem(item, parents)
+        // Callers read the source of a section they have just loaded (the
+        // renderer pairs `section.load()` with `section.loadContent()`), and
+        // there is no matching unload for this call, so reuse the reference
+        // they already hold rather than taking one that is never released.
+        const url = this.#cache.get(item?.href) ?? await this.loadItem(item, parents)
         if (url) return this.#cacheXHTMLContent.get(url)?.data
     }
     tryImageEntryItem(path) {
@@ -921,14 +1051,10 @@ class Loader {
 
         // parse and replace in HTML
         if ([MIME.XHTML, MIME.HTML, MIME.SVG].includes(mediaType)) {
-            let doc = new DOMParser().parseFromString(str, mediaType)
-            // change to HTML if it's not valid XHTML
-            if (mediaType === MIME.XHTML && (doc.querySelector('parsererror')
-            || !doc.documentElement?.namespaceURI)) {
-                console.warn(doc.querySelector('parsererror')?.innerText ?? 'Invalid XHTML')
-                item.mediaType = MIME.HTML
-                doc = new DOMParser().parseFromString(str, item.mediaType)
-            }
+            const parsed = parseContentDocument(new DOMParser(), str, mediaType)
+            const doc = parsed.doc
+            // it's now HTML if it wasn't valid XHTML even after repair
+            item.mediaType = parsed.mediaType
             // replace hrefs in XML processing instructions
             // this is mainly for SVGs that use xml-stylesheet
             if ([MIME.XHTML, MIME.SVG].includes(item.mediaType)) {
@@ -1122,6 +1248,11 @@ ${doc.querySelector('parsererror').innerText}`)
                 unload: () => this.#loader.unloadItem(item),
                 loadText: () => this.#loader.loadText(item.href),
                 loadContent: () => this.#loader.loadItemXHTMLContent(item),
+                // Load a resource a script references after the section was
+                // rendered (a <video src> built on click); `loadReplaced` only
+                // saw what was in the markup. The section is its parent, so it
+                // is released together with the section.
+                loadHref: href => this.#loader.loadHref(href, item.href),
                 createDocument: () => this.loadDocument(item),
                 size: this.getSize(item.href),
                 cfi: this.resources.cfis[index],
@@ -1181,7 +1312,7 @@ ${doc.querySelector('parsererror').innerText}`)
     }
     async loadDocument(item) {
         const str = await this.loadText(item.href)
-        return this.parser.parseFromString(str, item.mediaType)
+        return parseContentDocument(this.parser, str, item.mediaType).doc
     }
     getMediaOverlay() {
         return new MediaOverlay(this, this.#loadXML.bind(this))
@@ -1209,9 +1340,17 @@ ${doc.querySelector('parsererror').innerText}`)
     }
     async getCover() {
         const cover = this.resources?.cover
-        return cover?.href
-            ? new Blob([await this.loadBlob(cover.href)], { type: cover.mediaType })
-            : null
+        if (cover?.href) return new Blob([await this.loadBlob(cover.href)],
+            { type: cover.mediaType })
+        // Fall back to a cover-named container entry. Some EPUBs ship the
+        // cover image without ever declaring it (no `cover-image` property,
+        // no `<meta name="cover">` target, no manifest item), which leaves
+        // every manifest-driven lookup above empty even though the image is
+        // sitting right there in the zip.
+        const href = findUndeclaredCover(this.entries.keys())
+        if (!href) return null
+        const blob = await this.loadBlob(href)
+        return blob ? new Blob([blob], { type: getImageMediaType(href) }) : null
     }
     async getCalibreBookmarks() {
         const txt = await this.loadText('META-INF/calibre_bookmarks.txt')
