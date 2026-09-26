@@ -1,5 +1,10 @@
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 
+// A microtask (or rAF alone) resumes before paint. Give input and rendering a
+// turn between the style, host-load, and pagination phases of a chapter load.
+const yieldToFrame = () => document.hidden ? wait(0)
+    : new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)))
+
 // WebKit before Safari 17 (iOS <= 16) resolves the `document.fonts.ready`
 // promise synchronously while purging still-loading `@font-face`s during a
 // style resolver rebuild (CSSFontFaceSet::purge). Script execution is
@@ -593,6 +598,14 @@ export const getDirection = doc => {
     return { vertical, rtl }
 }
 
+// The spine's `page-progression-direction` is a publication-wide declaration,
+// so it outranks the direction of any single content document: an LTR colophon
+// in a Japanese book still pages right-to-left. Only `ltr` and `rtl` are
+// binding — an absent attribute or the `default` keyword leaves the choice to
+// the Reading System, which falls back to the document.
+export const getPageProgressionRTL = (bookDir, documentRTL) =>
+    bookDir === 'rtl' ? true : bookDir === 'ltr' ? false : documentRTL
+
 const getBackground = doc => {
     // Same blank/detached-document guard as getDirection (READEST-2X).
     if (!doc.defaultView || !doc.body) return ''
@@ -688,6 +701,14 @@ class View {
     #overlayer
     #vertical = false
     #rtl = false
+    // The document's own inline direction, read before any of our overrides
+    // touch it. `#rtl` is the book's page progression, which can disagree.
+    #docDirection = 'ltr'
+    // The document `load()` has taken `#docDirection` from. A re-render can
+    // reach this view earlier, while the iframe holds a section whose load
+    // event has not fired yet; see `render()`.
+    #loadedDoc = null
+    #directionStyle = null
     #column = true
     #size
     #columnCount = 1
@@ -738,13 +759,18 @@ class View {
     get contentPages() {
         return this.#contentPages
     }
-    async load(src, data, afterLoad, beforeRender) {
+    async load(src, data, afterLoad, beforeRender, waitForIdle) {
         if (typeof src !== 'string') throw new Error(`${src} is not string`)
         return new Promise(resolve => {
             this.#iframe.addEventListener('load', async () => {
+                // A background fetch can finish after a swipe has started.
+                // Defer its style/layout work, not just the start of preloading.
+                if (waitForIdle) await waitForIdle()
                 const doc = this.document
                 if (!doc?.documentElement || !doc.body) return resolve()
-                afterLoad?.(doc)
+                await afterLoad?.(doc)
+                await yieldToFrame()
+                if (this.document !== doc) return resolve()
 
                 this.#iframe.setAttribute('aria-label', doc.title)
                 // it needs to be visible for Firefox to get computed style
@@ -793,6 +819,7 @@ class View {
                         new Promise(res => { timer = setTimeout(res, 3000) }),
                     ])
                     clearTimeout(timer)
+                    if (waitForIdle) await waitForIdle()
                 }
                 // Awaiting the background image yields control, so the view may
                 // have been torn down or reloaded meanwhile — don't render into
@@ -802,6 +829,10 @@ class View {
 
                 this.#vertical = vertical
                 this.#rtl = rtl
+                this.#docDirection =
+                    doc.defaultView.getComputedStyle(doc.documentElement).direction === 'rtl'
+                        ? 'rtl' : 'ltr'
+                this.#loadedDoc = doc
 
                 this.#contentRange.selectNodeContents(doc.body)
                 const layout = beforeRender?.({ vertical, rtl })
@@ -826,8 +857,29 @@ class View {
     }
     render(layout) {
         if (!layout || !this.document?.documentElement) return
+        // A resize or an attribute change re-renders every view that already
+        // has a document, and the iframe reports the incoming section as its
+        // document as soon as it commits — well before the load event where
+        // `#docDirection` is taken. Rendering it there would stamp the
+        // progression override onto a document whose own direction has not
+        // been read yet, and that read would then come back as the override
+        // itself: the view would look like it already agrees with the book,
+        // the override would be dropped, and the section's columns would run
+        // against the scroll for good. The load handler renders it anyway.
+        if (this.document !== this.#loadedDoc) return
+        if (layout.rtl != null) this.#rtl = layout.rtl
         this.#column = layout.flow !== 'scrolled'
         this.#layout = layout
+        // Column boxes are laid out along the multi-column container's inline
+        // direction, so a section whose own direction disagrees with the book's
+        // page progression would run its columns against the scroll and open on
+        // its last page. Give the multicol box the progression instead, and hand
+        // the document's own direction back to the content. Vertical writing
+        // paginates along `scrollTop` with the host grid left alone, and there
+        // `direction` picks the line-stacking axis rather than the column order,
+        // so leave it — as scrolled flow, which has no columns to order, does.
+        this.#setProgressionDirection(
+            this.#column && !this.#vertical ? this.#rtl ? 'rtl' : 'ltr' : null)
         if (this.#column) this.columnize(layout)
         else this.scrolled(layout)
     }
@@ -867,6 +919,33 @@ class View {
         this.setImageSize(availableWidth, availableHeight)
         this.expand()
     }
+    // In an HTML document the principal writing mode — the one the root
+    // element's own box uses, and with it the order of its column boxes — is
+    // taken from `body`, not from the root (CSS Writing Modes §8.1). So the
+    // progression has to be written onto `body`, which is also where the text
+    // direction lives; a rule one level down gives the content back the
+    // direction the book authored, leaving elements that declare one alone.
+    #setProgressionDirection(direction) {
+        const doc = this.document
+        if (!doc?.head) return
+        if (!direction || direction === this.#docDirection) {
+            doc.documentElement.style.removeProperty('direction')
+            doc.body?.style.removeProperty('direction')
+            this.#directionStyle?.remove()
+            this.#directionStyle = null
+            return
+        }
+        setStylesImportant(doc.documentElement, { 'direction': direction })
+        if (doc.body) setStylesImportant(doc.body, { 'direction': direction })
+        // The view outlives its documents, so a style element kept from the
+        // previous section is detached by the time this one renders.
+        if (this.#directionStyle?.ownerDocument !== doc) {
+            this.#directionStyle = doc.createElement('style')
+            doc.head.append(this.#directionStyle)
+        }
+        this.#directionStyle.textContent =
+            `body > *:not([dir]) { direction: ${this.#docDirection}; }`
+    }
     columnize({ width, height, marginTop, marginRight, marginBottom, marginLeft, gap, columnWidth, columnCount }) {
         const vertical = this.#vertical
         this.#size = vertical ? height : width
@@ -894,11 +973,20 @@ class View {
             // fix glyph clipping in WebKit
             '-webkit-line-box-contain': 'block glyphs replaced',
         })
+        // Along the pagination axis every page is a tile of `size / columnCount`
+        // and the root's own side padding sits inside that tile, so the column's
+        // content box is the tile minus the padding. `--available-*` and the
+        // image clamp must use the content box: sized to the whole tile, a
+        // replaced element runs across the column gap and its trailing edge
+        // paints down the margin of the next page (readest/readest#6221).
+        // `--full-*` keeps the whole tile, which is what a bleed spans.
+        const pageWidth = Math.trunc(width / this.#columnCount)
+        const pageHeight = Math.trunc(height / this.#columnCount)
         const availableWidth = vertical
             ? Math.trunc(width - marginLeft / 2 - marginRight / 2 - gap)
-            : Math.trunc(width / this.#columnCount)
+            : Math.trunc(width / this.#columnCount - sidePaddingLeft - sidePaddingRight)
         const availableHeight = vertical
-            ? Math.trunc(height / this.#columnCount)
+            ? Math.trunc(height / this.#columnCount - marginTop * 1.5 - marginBottom * 1.5)
             : Math.trunc(height - marginTop - marginBottom)
         setStyles(doc.documentElement, {
             'padding': vertical
@@ -908,8 +996,8 @@ class View {
             '--page-margin-right': `${vertical ? marginRight : sidePaddingRight}px`,
             '--page-margin-bottom': `${vertical ? marginBottom * 1.5 : marginBottom}px`,
             '--page-margin-left': `${vertical ? marginLeft : sidePaddingLeft}px`,
-            '--full-width': `${Math.trunc(availableWidth)}`,
-            '--full-height': `${Math.trunc(availableHeight)}`,
+            '--full-width': `${vertical ? availableWidth : pageWidth}`,
+            '--full-height': `${vertical ? pageHeight : availableHeight}`,
             '--available-width': `${availableWidth}`,
             '--available-height': `${availableHeight}`,
         })
@@ -1080,7 +1168,9 @@ class View {
         return 1.0
     }
     expand() {
-        if (!this.document?.documentElement) return
+        // Font-ready callbacks can run while a preload yields between phases.
+        // Its range and page geometry are not initialized until first render.
+        if (!this.document?.documentElement || this.document !== this.#loadedDoc) return
         const { documentElement } = this.document
         if (this.#column) {
             const side = this.#vertical ? 'height' : 'width'
@@ -1965,7 +2055,7 @@ export class Paginator extends HTMLElement {
         if (!ctx) return
         this.#paintPaginatedBackground(ctx, atPosition)
     }
-    #beforeRender({ vertical, rtl }) {
+    #beforeRender({ vertical, rtl: documentRTL }) {
         // If writing-mode is about to change, destroy all non-primary
         // views BEFORE updating global state. This prevents stale views
         // with the wrong direction from remaining in the container while
@@ -1976,7 +2066,12 @@ export class Paginator extends HTMLElement {
             }
         }
         this.#vertical = vertical
-        this.#rtl = rtl
+        // One scroll container holds the views of several sections at once, so
+        // the progression cannot be per-document: a section that flipped it
+        // would reverse the sections mounted beside it. The publication-wide
+        // declaration settles it for the whole book; only a book that declares
+        // nothing still follows its documents.
+        this.#rtl = getPageProgressionRTL(this.bookDir, documentRTL)
         this.#top.classList.toggle('vertical', vertical)
         this.#container.classList.toggle('vertical', vertical)
 
@@ -2046,7 +2141,7 @@ export class Paginator extends HTMLElement {
             this.columnCount = 1
             this.#replaceBackground()
 
-            const layout = { width, height, flow, marginTop, marginRight, marginBottom, marginLeft, gap, columnWidth, columnCount: 1 }
+            const layout = { width, height, flow, marginTop, marginRight, marginBottom, marginLeft, gap, columnWidth, columnCount: 1, rtl: this.#rtl }
             this.#lastLayout = layout
             return layout
         }
@@ -2057,7 +2152,7 @@ export class Paginator extends HTMLElement {
         // `dir` mirrors the horizontal scroll coordinates (negative scrollLeft
         // for RTL). Vertical books page along scrollTop, which never flips, so
         // an RTL writing mode must not reverse the host grid there.
-        this.setAttribute('dir', rtl && !vertical ? 'rtl' : 'ltr')
+        this.setAttribute('dir', this.#rtl && !vertical ? 'rtl' : 'ltr')
 
         // set background to `doc` background
         // this is needed because the iframe does not fill the whole element
@@ -2081,7 +2176,7 @@ export class Paginator extends HTMLElement {
         this.#header.replaceChildren(...heads)
         this.#footer.replaceChildren(...feet)
 
-        const layout = { width, height, marginTop, marginRight, marginBottom, marginLeft, gap, columnWidth, columnCount: divisor }
+        const layout = { width, height, marginTop, marginRight, marginBottom, marginLeft, gap, columnWidth, columnCount: divisor, rtl: this.#rtl }
         this.#lastLayout = layout
         return layout
     }
@@ -2253,14 +2348,17 @@ export class Paginator extends HTMLElement {
         if (!this.#scrollBounds) return
         // Page-turn swipes are horizontal in every writing mode: vertical-rl
         // books turn pages right-to-left like printed Japanese books
-        // (readest#624), vertical-lr left-to-right. A predominantly vertical
-        // swipe on a vertical book still pages along the block axis so the
-        // legacy gesture keeps working.
+        // (readest#624), vertical-lr left-to-right. Vertical gestures belong
+        // to the host's toolbar toggle, including a sideways lift-off flick.
+        // Settle any horizontal drag started before the gesture turned vertical.
+        if (this.#vertical && Math.abs(dx) <= Math.abs(dy)) {
+            this.#settleDrag()
+            return
+        }
         const horizontal = Math.abs(vx) * 2 > Math.abs(vy)
-        const useHorizontal = horizontal || !this.#vertical
         const pages = this.#renderedPages
         let page
-        if (this.#vertical && useHorizontal && !this.#layeredTurn
+        if (this.#vertical && !this.#layeredTurn
             && this.hasAttribute('animated') && !this.hasAttribute('eink')) {
             // Drag-follow gestures on vertical books (readest#624): the views
             // tracked the finger, so judge the turn like a paged carousel by
@@ -2284,9 +2382,9 @@ export class Paginator extends HTMLElement {
             }
             page = this.#renderedPage + turn * forwardSign
         } else {
-            const velocity = useHorizontal ? vx : vy
-            const avgVelocity = useHorizontal ? dx / dt : dy / dt
-            // Without drag-follow (eink, animation off, block-axis swipes,
+            const velocity = vx
+            const avgVelocity = dx / dt
+            // Without drag-follow (eink, animation off,
             // layered turn styles) the scroll position never moves with the
             // finger; judge the whole gesture by displacement (avgVelocity)
             // like the eink path.
@@ -2299,13 +2397,9 @@ export class Paginator extends HTMLElement {
             // whose finger hooks sideways in its final milliseconds read as
             // horizontal, and the displacement heuristic amplified the tiny
             // net x-drift into a random page turn (layered slide on Android).
-            const aligned = useHorizontal
-                ? (snapping ? horizontal : Math.abs(dx) > Math.abs(dy))
-                : true
-            // Horizontal swipes advance against the page progression (RTL:
-            // next page is to the left); block-axis swipes always advance
-            // with the scroll axis.
-            const sign = useHorizontal && this.#rtl ? -1 : 1
+            const aligned = snapping ? horizontal : Math.abs(dx) > Math.abs(dy)
+            // Horizontal swipes advance against the page progression.
+            const sign = this.#rtl ? -1 : 1
             const [offset, a, b] = this.#scrollBounds
             const size = this.size
             const start = this.#renderedStart
@@ -2869,7 +2963,7 @@ export class Paginator extends HTMLElement {
         if (this.hasAttribute('no-swipe')) return
         const layeredRejected = this.#layeredTurn
             && state?.layeredGesture === 'rejected'
-        // Horizontal books have no block-axis page gesture to preserve.
+        // Vertical books still need snap() to settle any horizontal drag.
         if (layeredRejected && !this.#vertical) return
 
         // A finger that rested before lifting has no flick momentum; the
@@ -2955,7 +3049,7 @@ export class Paginator extends HTMLElement {
                 const { vx, vy, dx, dy, dt } = snapState
                 // Direction ownership is final for this touch sequence. Once
                 // vertical wins the layered arena, discard later horizontal
-                // hooks while preserving block-axis paging in vertical books.
+                // hooks; snap() settles any horizontal drag in vertical books.
                 this.snap(layeredRejected ? 0 : vx, vy,
                     layeredRejected ? 0 : dx, dy, dt)
             }
@@ -3517,10 +3611,11 @@ export class Paginator extends HTMLElement {
                         prop => doc.documentElement.setAttribute('data-' + prop, ''))
                     this.#styleMap.set(doc, [$styleBefore, $style])
                 }
-                onLoad?.({ doc, index })
+                return onLoad?.({ doc, index })
             }
             const beforeRender = this.#beforeRender.bind(this)
             await view.load(src, data, afterLoad, beforeRender)
+            if (this.#views.get(index) !== view) return
             if (!view.document?.documentElement || !view.document.body) {
                 this.#destroyView(index)
                 this.#primaryIndex = this.#sortedViews[0]?.[0] ?? -1
@@ -3595,7 +3690,7 @@ export class Paginator extends HTMLElement {
             const src = await section.load()
             const data = await section.loadContent?.()
             const view = this.#createView(index)
-            const afterLoad = doc => {
+            const afterLoad = async doc => {
                 if (doc.head) {
                     const $styleBefore = doc.createElement('style')
                     doc.head.prepend($styleBefore)
@@ -3605,7 +3700,11 @@ export class Paginator extends HTMLElement {
                         prop => doc.documentElement.setAttribute('data-' + prop, ''))
                     this.#styleMap.set(doc, [$styleBefore, $style])
                 }
-                this.setStyles(this.#styles)
+                // A preload needs its own styles, not a restyle and font-ready
+                // remeasurement of every chapter the reader can already see.
+                this.#applyStyles(doc)
+                await yieldToFrame()
+                if (this.#views.get(index) !== view || view.document !== doc) return
                 this.dispatchEvent(new CustomEvent('load', { detail: { doc, index } }))
             }
             // Adjacent sections reuse the primary view's cached layout
@@ -3613,7 +3712,20 @@ export class Paginator extends HTMLElement {
             // global state (direction, CSS classes, dir attribute, etc.).
             const cachedLayout = this.#lastLayout
             const beforeRender = () => cachedLayout
-            await view.load(src, data, afterLoad, beforeRender)
+            await view.load(src, data, afterLoad, beforeRender, async () => {
+                // touchend queues the snap in rAF. Require two idle frames so
+                // we cannot slip layout between finger release and that snap.
+                // Stop waiting when navigation has discarded this view.
+                for (let idleFrames = 0; idleFrames < 2 && this.#views.get(index) === view;) {
+                    // Near the viewport this is required content, not spare
+                    // buffer. Holding it back exposes an unrendered placeholder
+                    // and can make boundary navigation skip the section.
+                    if (this.#getViewOffset(index) <= this.#renderedEnd + this.size) return
+                    await new Promise(resolve => requestAnimationFrame(resolve))
+                    idleFrames = this.#touchState?.active || this.#isAnimating ? 0 : idleFrames + 1
+                }
+            })
+            if (this.#views.get(index) !== view) return
             if (!view.document?.documentElement || !view.document.body) {
                 this.#destroyView(index)
                 return
@@ -3814,10 +3926,12 @@ export class Paginator extends HTMLElement {
                 this.#clearViewsExcept(keep)
             }
             const oldIndex = this.#primaryIndex
-            const onLoad = detail => {
+            const onLoad = async detail => {
                 if (oldIndex >= 0 && !this.#views.has(oldIndex))
                     this.sections[oldIndex]?.unload?.()
-                this.setStyles(this.#styles)
+                this.#applyStyles(detail.doc)
+                await yieldToFrame()
+                if (this.#views.get(index)?.document !== detail.doc) return
                 this.dispatchEvent(new CustomEvent('load', { detail }))
             }
             await this.#display(Promise.resolve(section.load())
@@ -3939,17 +4053,22 @@ export class Paginator extends HTMLElement {
         }
         return contents
     }
+    #applyStyles(doc) {
+        const $$styles = this.#styleMap.get(doc)
+        if (!$$styles) return
+        const [$beforeStyle, $style] = $$styles
+        const styles = this.#styles
+        if (Array.isArray(styles)) {
+            const [beforeStyle, style] = styles
+            $beforeStyle.textContent = beforeStyle
+            $style.textContent = style
+        } else $style.textContent = styles
+    }
     setStyles(styles) {
         this.#styles = styles
         for (const [, view] of this.#views) {
-            const $$styles = this.#styleMap.get(view.document)
-            if (!$$styles) continue
-            const [$beforeStyle, $style] = $$styles
-            if (Array.isArray(styles)) {
-                const [beforeStyle, style] = styles
-                $beforeStyle.textContent = beforeStyle
-                $style.textContent = style
-            } else $style.textContent = styles
+            if (!this.#styleMap.has(view.document)) continue
+            this.#applyStyles(view.document)
 
             // needed because the resize observer doesn't work in Firefox
             fontsReady(view.document).then(() => view.expand())
